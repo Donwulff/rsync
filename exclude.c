@@ -1059,7 +1059,11 @@ void parse_filter_file(struct filter_list_struct *listp, const char *fname,
 				"failed to open %sclude file %s",
 				mflags & MATCHFLG_INCLUDE ? "in" : "ex",
 				fname);
+// 2006.01.10, Johnson Cheng
+// We shouldn't exit program even if exclude/include file is not exist
+#ifndef QNAPNAS
 			exit_cleanup(RERR_FILEIO);
+#endif
 		}
 		return;
 	}

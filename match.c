@@ -108,6 +108,10 @@ static void matched(int f, struct sum_struct *s, struct map_struct *buf,
 	int32 n = (int32)(offset - last_match); /* max value: block_size (int32) */
 	int32 j;
 
+#ifdef	RSYNC_PROGRESS
+	extern char  *pszSchedule;
+#endif	//RSYNC_PROGRESS
+
 	if (verbose > 2 && i >= 0) {
 		rprintf(FINFO,
 			"match at %.0f last_match=%.0f j=%d len=%ld n=%ld\n",
@@ -132,6 +136,20 @@ static void matched(int f, struct sum_struct *s, struct map_struct *buf,
 		last_match = offset + s->sums[i].len;
 	else
 		last_match = offset;
+
+#ifdef	RSYNC_PROGRESS
+	if (buf && pszSchedule)  Sending_File(&stats, buf->file_size, last_match);
+#endif	//RSYNC_PROGRESS
+
+//--req#1535, Myron Su, v4.1.2, 2014/09/08
+//Write speed data to schedule job config
+//Working on '--schedule=' option
+#ifdef QNAPNAS
+	extern char  *pszSchedule;
+	if (pszSchedule)	//no '--schedule', do the following
+		do_progress = 1;
+#endif
+//[ok]--req#1535, Myron Su, v4.1.2, 2014/09/18
 
 	if (buf && do_progress)
 		show_progress(last_match, buf->file_size);
@@ -332,6 +350,10 @@ void match_sums(int f, struct sum_struct *s, struct map_struct *buf, OFF_T len)
 	char file_sum[MAX_DIGEST_LEN];
 	int sum_len;
 
+#ifdef	RSYNC_PROGRESS
+	extern char  *pszSchedule;
+#endif	//RSYNC_PROGRESS
+
 	last_match = 0;
 	false_alarms = 0;
 	hash_hits = 0;
@@ -344,6 +366,11 @@ void match_sums(int f, struct sum_struct *s, struct map_struct *buf, OFF_T len)
 		if (append_mode == 2) {
 			OFF_T j = 0;
 			for (j = CHUNK_SIZE; j < s->flength; j += CHUNK_SIZE) {
+
+#ifdef	RSYNC_PROGRESS
+				if (buf && pszSchedule)  Sending_File(&stats, buf->file_size, last_match);
+#endif	//RSYNC_PROGRESS
+
 				if (buf && do_progress)
 					show_progress(last_match, buf->file_size);
 				sum_update(map_ptr(buf, last_match, CHUNK_SIZE),
@@ -352,6 +379,11 @@ void match_sums(int f, struct sum_struct *s, struct map_struct *buf, OFF_T len)
 			}
 			if (last_match < s->flength) {
 				int32 n = (int32)(s->flength - last_match);
+
+#ifdef	RSYNC_PROGRESS
+				if (buf && pszSchedule)  Sending_File(&stats, buf->file_size, last_match);
+#endif	//RSYNC_PROGRESS
+
 				if (buf && do_progress)
 					show_progress(last_match, buf->file_size);
 				sum_update(map_ptr(buf, last_match, n), n);

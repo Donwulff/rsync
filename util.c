@@ -699,7 +699,9 @@ int glob_expand(const char *arg, char ***argv_p, int *argc_p, int *maxargs_p)
 /* This routine is only used in daemon mode. */
 void glob_expand_module(char *base1, char *arg, char ***argv_p, int *argc_p, int *maxargs_p)
 {
-	char *p, *s;
+    //Tom_change for #bug58773
+	char *p=NULL, *s=NULL;
+	//-/
 	char *base = base1;
 	int base_len = strlen(base);
 
@@ -717,8 +719,12 @@ void glob_expand_module(char *base1, char *arg, char ***argv_p, int *argc_p, int
 	base_len++;
 
 	for (s = arg; *s; s = p + base_len) {
-		if ((p = strstr(s, base)) != NULL)
-			*p = '\0'; /* split it at this point */
+	        
+		//--Tom change, Bug 58773
+		//if ((p = strstr(s, base)) != NULL)
+		//	*p = '\0'; /* split it at this point */
+		//--/	
+
 		glob_expand(s, argv_p, argc_p, maxargs_p);
 		if (!p)
 			break;

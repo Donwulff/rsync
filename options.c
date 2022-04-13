@@ -85,6 +85,18 @@ int numeric_ids = 0;
 int allow_8bit_chars = 0;
 int force_delete = 0;
 int io_timeout = 0;
+#ifdef QNAPNAS
+int qnap_mode = 0;
+int check_dest = 0;
+char *password = NULL; //Richard 20070516 add
+int sever_mode = 1;//Richard 20080111 add
+char *pszSchedule = NULL;	///< the current schedule name
+char *pszProgressConf = NULL;   // assign a progress config for record progress
+int iForceRsyncUser = 0;        // force use rsync user and password don't check uLinux
+#endif
+#ifdef	RSYNC_PROGRESS
+int g_bDbgProg = 0;		// Debug progress.
+#endif	//	RSYNC_PROGRESS
 int allowed_lull = 0;
 int prune_empty_dirs = 0;
 int use_qsort = 0;
@@ -123,6 +135,18 @@ int inplace = 0;
 int delay_updates = 0;
 long block_size = 0; /* "long" because popt can't set an int32. */
 char *skip_compress = NULL;
+
+//jeff modify 2012.06.27, if execute rysnc alone but not by QNAP job, we can't set limit rate.(let power users use --bwlimit in command line)
+#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+int g_bQnapBwlimit = 0;
+int g_bQnapSSHBwlimit = 0;
+#endif
+#ifdef QNAPNAS
+int g_bNoChecksum = 0;
+int g_bXattr_richacl = 0;          // richacl fro xattr
+#endif
+int g_bSnapshot = 0;
+char *g_cProgressLog = NULL;
 
 /** Network address family. **/
 int default_af_hint
@@ -431,6 +455,13 @@ void usage(enum logcode F)
 #ifdef ICONV_OPTION
   rprintf(F,"     --iconv=CONVERT_SPEC    request charset conversion of filenames\n");
 #endif
+#ifdef QNAPNAS
+  rprintf(F,"     --qnap-mode=mode        0:Normal, 1:QRAID1, 2:USB copy 3:HD copy USB\n");
+  rprintf(F,"     --check-dest        	  Check if the destination path is valid\n");
+  rprintf(F,"     --password=WORD         the password of QNAP mode\n");
+  rprintf(F,"     --sever-mode=mode       0:Normal, 1:QNAP in daemon-mode\n");//Richard 20080111 add
+  rprintf(F,"     --schedule=name         specify the schedule name\n");
+#endif
   rprintf(F," -4, --ipv4                  prefer IPv4\n");
   rprintf(F," -6, --ipv6                  prefer IPv6\n");
   rprintf(F,"     --version               print version number\n");
@@ -633,6 +664,27 @@ static struct poptOption long_options[] = {
   {"iconv",            0,  POPT_ARG_STRING, &iconv_opt, 0, 0, 0 },
   {"no-iconv",         0,  POPT_ARG_NONE,   0, OPT_NO_ICONV, 0, 0 },
 #endif
+#ifdef QNAPNAS
+  {"qnap-mode",        0,  POPT_ARG_INT,    &qnap_mode, 0, 0, 0 },
+  {"check-dest",       0,  POPT_ARG_NONE,   &check_dest, 0, 0, 0 },
+  //Richard 20070516 add
+  {"password",         0,  POPT_ARG_STRING, &password, 0, 0, 0 },
+  //Richard 20080111 add
+  {"sever-mode",       0,  POPT_ARG_INT,    &sever_mode, 0, 0, 0 },
+  {"schedule",         0,  POPT_ARG_STRING, &pszSchedule, 0, 0, 0 },
+  {"progress-conf",    0,  POPT_ARG_STRING, &pszProgressConf, 0, 0, 0 },
+  //jeff modify 2012.06.27, if execute rysnc alone but not by QNAP job, we can't set limit rate.(let power users use --bwlimit in command line)
+  {"qnap-bwlimit",     0,  POPT_ARG_NONE,    &g_bQnapBwlimit, 0, 0, 0 },
+  // jeff modify 2012.11.9, for ssh bandwidth limit.
+  {"qnap-ssh-bwlimit",     0,  POPT_ARG_NONE,    &g_bQnapSSHBwlimit, 0, 0, 0 },
+  {"nochecksum",     0,  POPT_ARG_NONE,    &g_bNoChecksum, 0, 0, 0 },
+  {"xattr-richacl",     0,  POPT_ARG_NONE,    &g_bXattr_richacl, 0, 0, 0 },
+#endif
+  {"snapshot",     0,  POPT_ARG_NONE,    &g_bSnapshot, 0, 0, 0 },
+  {"progresslog",            0,  POPT_ARG_STRING, &g_cProgressLog, 0, 0, 0 },
+#ifdef	RSYNC_PROGRESS
+  {"debug-progress",   0,  POPT_ARG_INT,   	&g_bDbgProg, 0, 0, 0 },
+#endif	//	RSYNC_PROGRESS
   {"ipv4",            '4', POPT_ARG_VAL,    &default_af_hint, AF_INET, 0, 0 },
   {"ipv6",            '6', POPT_ARG_VAL,    &default_af_hint, AF_INET6, 0, 0 },
   {"8-bit-output",    '8', POPT_ARG_VAL,    &allow_8bit_chars, 1, 0, 0 },
@@ -675,6 +727,10 @@ static void daemon_usage(enum logcode F)
   rprintf(F," -4, --ipv4                  prefer IPv4\n");
   rprintf(F," -6, --ipv6                  prefer IPv6\n");
   rprintf(F,"     --help                  show this help screen\n");
+#ifdef QNAPNAS
+  rprintf(F,"     --sever-mode=mode       0:Normal, 1:QNAP in daemon-mode\n");//Richard 20080111 add
+  rprintf(F,"     --qnap-bwlimit          using qnap bandwidth limit, exclusive with --bwlimit\n");
+#endif
 
   rprintf(F,"\n");
   rprintf(F,"If you were not trying to invoke rsync as a daemon, avoid using any of the\n");
@@ -702,6 +758,16 @@ static struct poptOption long_daemon_options[] = {
   {"no-verbose",       0,  POPT_ARG_VAL,    &verbose, 0, 0, 0 },
   {"no-v",             0,  POPT_ARG_VAL,    &verbose, 0, 0, 0 },
   {"help",            'h', POPT_ARG_NONE,   0, 'h', 0, 0 },
+#ifdef QNAPNAS
+  //Richard 20080111 add
+  {"sever-mode",       0,  POPT_ARG_INT,    &sever_mode, 0, 0, 0 },
+  //jeff modify 2012.06.27, if execute rysnc alone but not by QNAP job, we can't set limit rate.(let power users use --bwlimit in command line)
+  {"qnap-bwlimit",     0,  POPT_ARG_NONE,    &g_bQnapBwlimit, 0, 0, 0 },
+  {"force-use-rsync-user",0,  POPT_ARG_NONE, &iForceRsyncUser, 0, 0, 0 },
+  {"nochecksum",     0,  POPT_ARG_NONE,    &g_bNoChecksum, 0, 0, 0 },
+  {"xattr-richacl",     0,  POPT_ARG_NONE,    &g_bXattr_richacl, 0, 0, 0 },
+#endif
+  {"snapshot",     0,  POPT_ARG_NONE,    &g_bSnapshot, 0, 0, 0 },
   {0,0,0,0, 0, 0, 0}
 };
 
@@ -1007,6 +1073,20 @@ int parse_arguments(int *argc_p, const char ***argv_p)
 			am_starting_up = 0;
 			daemon_opt = 0;
 			am_daemon = 1;
+			
+			#if 0
+			// jeff modify 2011.8.26, for limit band width, let daemon can limit band width. (--daemon and --bwlimit is exclusive)
+			#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+			if (daemon_bwlimit && (!bwlimit || bwlimit > daemon_bwlimit))
+				bwlimit = daemon_bwlimit;
+			if (bwlimit) {
+				bwlimit_writemax = (size_t)bwlimit * 128;
+				if (bwlimit_writemax < 512)
+					bwlimit_writemax = 512;
+			}
+			#endif /* QNAPNAS && SUPPORT_LIMITRATE */
+			#endif
+
 			return 1;
 
 		case OPT_MODIFY_WINDOW:

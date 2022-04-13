@@ -204,6 +204,17 @@ int do_mkdir(char *fname, mode_t mode)
 	if (dry_run) return 0;
 	RETURN_ERROR_IF_RO_OR_LO;
 	trim_trailing_slashes(fname);
+
+#ifdef QNAPNAS
+		extern int  g_bNTFS;
+		if (g_bNTFS && (NULL != strchr(fname, ':')))
+		{
+			//rprintf(FERROR, "!!! Try to mkdir(%s) on a NTFS! Just return error!\n", fname);
+			errno = EINVAL;
+			return -1;
+		}
+#endif	//QNAPNAS
+
 	return mkdir(fname, mode);
 }
 
@@ -216,6 +227,18 @@ int do_mkstemp(char *template, mode_t perms)
 
 #if defined HAVE_SECURE_MKSTEMP && defined HAVE_FCHMOD && (!defined HAVE_OPEN64 || defined HAVE_MKSTEMP64)
 	{
+
+// BUG #13663: mkstemp() will hung on NTFS if the filename with ':' char.
+#ifdef QNAPNAS
+		extern int  g_bNTFS;
+		if (g_bNTFS && (NULL != strchr(template, ':')))
+		{
+			//rprintf(FERROR, "!!! Try to mkstemp(%s) on a NTFS! Just return error!\n", template);
+			errno = EINVAL;
+			return -1;
+		}
+#endif	//QNAPNAS
+
 		int fd = mkstemp(template);
 		if (fd == -1)
 			return -1;

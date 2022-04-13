@@ -27,6 +27,17 @@
 #include <locale.h>
 #endif
 
+#ifdef QNAPNAS
+#include "Util.h"
+#endif	//QNAPNAS
+
+#ifdef QTS_SNAPSHOT
+#include "storage_man.h"
+#include "v2/storage_pool.h"
+#include "v2/logical_volume.h"
+#include "v2/nas_snapshot.h"
+#endif
+
 extern int verbose;
 extern int dry_run;
 extern int list_only;
@@ -79,6 +90,71 @@ extern char curr_dir[MAXPATHLEN];
 extern struct file_list *first_flist;
 extern struct filter_list_struct daemon_filter_list;
 
+#ifdef RSYNC_PROGRESS
+extern struct filter_list_struct filter_list;
+#endif
+
+#ifdef QNAPNAS
+#define NORMAL_LOCK_FILE	"/var/run/rsync-normal.pid"
+#define QRAID1_LOCK_FILE	"/var/run/rsync-qraid1.pid"
+#define USBCOPY_LOCK_FILE	"/var/run/rsync-usbcopy.pid"
+#define HDCOPYUSB_LOCK_FILE	"/var/run/rsync-hdcopyusb.pid"
+enum { NORMAL, QRAID1, USB_COPY ,HD_COPY_USB, SNAPSHOT_COPY, SNAPSHOT_COPY_BY_SIZE, SNAPSHOT_RECEIVE_BY_SIZE};
+extern int do_progress;
+extern int qnap_mode;
+extern int do_xfers;
+// BUG #13663: mkstemp() will hung on NTFS if the filename with ':' char.
+int  g_bNTFS = 0;
+// Modified by Jeff Chang 2011/5/4, for service binding
+int  g_bHup=False;
+/**
+ * \brief	The SIGINT signal handler. (Ctrl-C)
+ */
+static void Signal_Handler_SigHup(int idSig)
+{
+	g_bHup = True;
+}
+
+#ifdef SUPPORT_LIMITRATE
+#include <sys/inotify.h>
+#include <sys/shm.h>
+int g_bDRateChild = FALSE;		//<<< The flag of stop monitering band width of child process.
+int g_bRate = FALSE;			//<<< The flag of stop monitering band width.
+
+#ifndef QNAP_CLIENT_LIMITRATE_BY_THREAD
+#define SIGRATE	SIGTRAP
+/**
+ * \brief	The SIGRATE signal handler.
+ */
+static void Signal_Handler_SigRate(int idSig)
+{
+	char szSLimitRate[11], szRLimitRate[11];
+	extern char *pszSchedule;
+
+	//jeff modify 2012.06.27, if execute rysnc alone but not by QNAP job, we can't set limit rate.(let power users use --bwlimit in command line)
+	if(!g_bQnapBwlimit)
+		return;
+	
+	// Read the conf file.
+	if (0 != Conf_Get_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNCD_SLIMITRATE, szSLimitRate, sizeof(szSLimitRate)))  strcpy(szSLimitRate, SZV_RSYNCD_SLIMITRATE_DEF);
+	if (0 != Conf_Get_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNCD_RLIMITRATE, szRLimitRate, sizeof(szRLimitRate)))  strcpy(szRLimitRate, SZV_RSYNCD_RLIMITRATE_DEF);
+	
+	am_sender ? (bwlimit = atoi(szSLimitRate) >> 10) : (bwlimit = atoi(szRLimitRate) >> 10);
+	
+	if (bwlimit) {
+		bwlimit_writemax = (size_t)bwlimit * 128;
+		if (bwlimit_writemax < 512)
+			bwlimit_writemax = 512;
+	}
+	else
+		bwlimit_writemax = 0;
+}
+#endif /* QNAP_CLIENT_LIMITRATE_BY_THREAD */
+#endif /* SUPPORT_LIMITRATE */
+#endif	//QNAPNAS
+
+
+
 uid_t our_uid;
 int am_receiver = 0;  /* Only set to 1 after the receiver/generator fork. */
 int am_generator = 0; /* Only set to 1 after the receiver/generator fork. */
@@ -89,7 +165,24 @@ int batch_gen_fd = -1;
 
 /* There's probably never more than at most 2 outstanding child processes,
  * but set it higher, just in case. */
-#define MAXCHILDPROCS 7
+#ifdef QTS_SNAPSHOT
+/* When create snapshot, there will be many child process when manipulate config, so enlarge the pid array.
+ * I observed that at most 100 child process shown in remember_children.
+ * To prevent the following error
+ * [~] # rsync -H -a --sever-mode=0 --sparse --qnap-bwlimit --schedule=Schedule0 --password=rsync --timeout=600 --port=873 /share/CACHEDEV1_DATA/Public/ /share/CACHEDEV1_DATA/Web/
+ * rsync: waitpid: No child processes (10)
+ * rsync error: waitpid() failed (code 21) at main.c(1572) [sender=3.0.7]
+ * [~] #
+ * enlarge from 128 to 384 on 20170215
+ * */
+#define MAXCHILDPROCS 384
+#else
+/* Bug 118929 - [Mantis#28195#28266][Hybrid Backup Sync] Rsync job enable encryption fail with "No child processes (10)"
+ * In the none snapshot model, original MAXCHILDPROCS 7 is not enough when rsync job over ssh.
+ * enlarge from 7 to 32 on 20180108
+ * */
+#define MAXCHILDPROCS 32
+#endif
 
 #ifdef HAVE_SIGACTION
 # ifdef HAVE_SIGPROCMASK
@@ -100,15 +193,197 @@ int batch_gen_fd = -1;
 static struct sigaction sigact;
 #endif
 
+#ifdef QTS_SNAPSHOT
+struct pid_status {
+	pid_t pid;
+	int status;
+};
+    struct pid_status *pid_stat_table = NULL;
+    int pid_stat_table_size = 0;
+#else
 struct pid_status {
 	pid_t pid;
 	int status;
 } pid_stat_table[MAXCHILDPROCS];
+#endif
 
 static time_t starttime, endtime;
 static int64 total_read, total_written;
 
 static void show_malloc_stats(void);
+
+#ifdef	RSYNC_PROGRESS
+
+#include <pthread.h>
+
+// The link list for string data.
+typedef struct _T_STR_NODE_
+{
+	struct _T_STR_NODE_		*ptNext;
+	short					cbData;
+	char					szData[0];
+} T_STR_NODE, *PT_STR_NODE;
+
+typedef struct _T_TST_PARAM_
+{
+	PT_TREE_STAT		pttStat;		// The pointer to a tree stat buffer.
+	long				bDone;			// The flag to indicate tree scan is done.
+	int					*pbAbort;		// The flag to ask thread to abort.
+	char				*pszpTree;		// The tree pathes to be scanned.
+} T_TST_PARAM, *PT_TST_PARAM;
+
+// Global variable for debuging.
+extern int g_bDbgProg;
+
+// The thread structure for tree scan.
+pthread_t  g_tThread;
+
+// The parameter struct of tree scan thread.
+T_TST_PARAM  g_ttParam;
+
+
+int Tree_Stat(PT_TREE_STAT pttStat, const char *pszpTree, int *pbAbort)
+{
+	int  iRet=0, cbPath, cbName, fdFolder;
+	char  szpTree[PATH_MAX];
+	DIR  *ptFolder=NULL;
+	struct stat  tStat;
+	struct dirent  *ptDirent;
+	PT_STR_NODE  ptsnHead=NULL, ptsnFolder;
+
+	// Check parameters first.
+	if (!pttStat || !pszpTree || !pbAbort)  return -EINVAL;
+	// Setup the folder path to be scanned.
+	cbPath = strlen(pszpTree);
+	memcpy(szpTree, pszpTree, cbPath);
+	if ('/' != szpTree[cbPath-1])  szpTree[cbPath++] = '/';
+	szpTree[cbPath] = 0;
+
+	// Check tree root folder status
+	if (0 != stat(szpTree, &tStat))
+	{
+		iRet = -errno;
+		if (g_bDbgProg)  printf("rsync: Can't fstat folder %s error! (%d)\n", szpTree, iRet);
+		goto exit_tree_stat;
+	}
+
+	// Enumerate all sub-folders.
+	while (!*pbAbort)
+	{
+		if (NULL != (ptFolder = opendir(szpTree)))
+		{
+			fdFolder = dirfd(ptFolder);
+			while (!*pbAbort && (NULL != (ptDirent = readdir(ptFolder))))
+			{
+				// Check file status
+				if (0 != fstatat(fdFolder, ptDirent->d_name, &tStat, AT_SYMLINK_NOFOLLOW))
+				{
+					iRet = -errno;
+					if (g_bDbgProg)  printf("rsync: Can't fstat file %s error! (%d)\n", ptDirent->d_name, iRet);
+					continue;
+				}
+				switch (S_IFMT & tStat.st_mode)
+				{
+				case S_IFDIR:		// Is a directory?
+					// Skip '.' and '..'
+					if (('.' == ptDirent->d_name[0]) && (!ptDirent->d_name[1] || (('.' == ptDirent->d_name[1]) && !ptDirent->d_name[2])))  continue;
+					//20170704 bug 105648 add handle --exclude
+					if (filter_list.head &&
+						(check_filter(&filter_list, FLOG, ptDirent->d_name, 1) < 0)) {
+						continue;
+					}
+					pttStat->cnFolders ++;
+					pttStat->cnBlocks += tStat.st_blocks;
+					// Push a folder node into the link list.
+					cbName = strlen(ptDirent->d_name);
+					if (NULL == (ptsnFolder = malloc(sizeof(T_STR_NODE)+cbName+1)))
+					{
+						iRet = -ENOMEM;
+						goto exit_tree_stat;
+					}
+					ptsnFolder->ptNext = ptsnHead;
+					ptsnFolder->cbData = cbName;
+					memcpy(ptsnFolder->szData, ptDirent->d_name, cbName+1);
+					ptsnHead = ptsnFolder;
+					break;
+				
+				case S_IFREG:		// Is a regular file?
+				case S_IFLNK:		// Is a symbolic link?
+					//20170704 bug 105648 add handle --exclude
+					if (filter_list.head &&
+						(check_filter(&filter_list, FLOG, ptDirent->d_name, 0) < 0)) {
+						rprintf(FINFO, "%s() skip file [%s]\n", __FUNCTION__, ptDirent->d_name);
+						continue;
+					}
+					pttStat->cnFiles ++;
+					pttStat->cbFiles += tStat.st_size;
+					pttStat->cnBlocks += tStat.st_blocks;
+					break;
+					
+				default:
+					break;
+				}
+			}
+			closedir(ptFolder);
+			ptFolder = NULL;
+		}
+		else
+		{
+			iRet = -errno;
+			if (g_bDbgProg)  printf("rsync: Can't opendir %s error! (%d)\n", szpTree, iRet);
+		}
+
+		// Pop the stated sub-folder if it is enumerated.
+		while (ptsnHead && ('/' == ptsnHead->szData[0]))
+		{
+			ptsnFolder = ptsnHead;
+			ptsnHead = ptsnFolder->ptNext;
+			cbPath -= (ptsnFolder->cbData + 1);
+			free(ptsnFolder);
+		}
+
+		// Enumerate the next sub-folder.
+		if (ptsnHead)
+		{
+			// Reconstruct the tree path.
+			memcpy(szpTree+cbPath, ptsnHead->szData, ptsnHead->cbData);
+			cbPath += ptsnHead->cbData;
+			szpTree[cbPath++] = '/';
+			szpTree[cbPath] = 0;
+			// mark this sub-folder as enumerated.
+			ptsnHead->szData[0] = '/';
+		}
+		// Break the loop if there are no sub-folder to be enumerated.
+		else  break;
+	}
+
+exit_tree_stat:
+	if (NULL != ptFolder)  closedir(ptFolder);
+	while (ptsnHead)
+	{
+		ptsnFolder = ptsnHead;
+		ptsnHead = ptsnFolder->ptNext;
+		free(ptsnFolder);
+	}
+	return iRet;
+}
+
+void *Tree_Scan_Thread(void *pParam)
+{
+	int  iRet=0;
+	PT_TST_PARAM  ptParam = (PT_TST_PARAM)pParam;
+	if (ptParam && ptParam->pttStat)
+	{
+		iRet = Tree_Stat(ptParam->pttStat, ptParam->pszpTree, ptParam->pbAbort);
+		ptParam->bDone = (0 > iRet) ? 2 : 1;
+	}
+	if (g_bDbgProg)  printf("rsync: scan tree thread exit: Folder: %lld, File: %lld, Size: %lld, Block: %lld (%d)\n",
+		ptParam->pttStat->cnFolders, ptParam->pttStat->cnFiles, ptParam->pttStat->cbFiles, ptParam->pttStat->cnBlocks, iRet);
+	pthread_exit(NULL);
+}
+
+#endif	//RSYNC_PROGRESS
+
 
 /* Works like waitpid(), but if we already harvested the child pid in our
  * remember_children(), we succeed instead of returning an error. */
@@ -124,7 +399,11 @@ pid_t wait_process(pid_t pid, int *status_ptr, int flags)
 		/* Status of requested child no longer available:  check to
 		 * see if it was processed by remember_children(). */
 		int cnt;
+#ifdef QTS_SNAPSHOT
+		for (cnt = 0; cnt < pid_stat_table_size; cnt++) {
+#else
 		for (cnt = 0; cnt < MAXCHILDPROCS; cnt++) {
+#endif
 			if (pid == pid_stat_table[cnt].pid) {
 				*status_ptr = pid_stat_table[cnt].status;
 				pid_stat_table[cnt].pid = 0;
@@ -270,6 +549,20 @@ static void output_summary(void)
 	}
 
 	if (verbose || do_stats) {
+#ifdef QNAPNAS
+		if(do_progress && (qnap_mode == QRAID1))
+		{
+			Set_Profile_Integer("QRAID1", "Progress", 100);
+			Set_Profile_Integer("QRAID1", STATUS_FIELD, S_READY);
+		}
+		if(do_progress && (qnap_mode == HD_COPY_USB))
+		{
+			FILE *fp;
+			fp=fopen("/tmp/hdcopyusb_process_log","w+");
+			fprintf(fp,"100%%");
+			fclose(fp);
+		}
+#endif
 		rprintf(FCLIENT, "\n");
 		rprintf(FINFO,
 			"sent %s bytes  received %s bytes  %s bytes/sec\n",
@@ -418,6 +711,9 @@ static pid_t do_cmd(char *cmd, char *machine, char *user, char **remote_argv, in
 		if (argc >= MAX_ARGS - 2)
 			goto arg_overflow;
 	}
+	// jeff modify 2012.11.9, for ssh bandwidth limit.
+	if(g_bQnapSSHBwlimit)
+		args[argc++] = SZ_OPT_QNAP_BWLIMIT;
 
 	args[argc++] = ".";
 
@@ -678,10 +974,72 @@ static void read_final_goodbye(int f_in)
 	}
 }
 
+#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+/**
+ * \brief	Update the band width value from share memory
+ * \param	pVoid	The buffer of connection info.
+ */
+void* Update_LimitRate_Child_Thread(void *pVoid)
+{
+	int iRet=0, idx=0, idShm=0;
+	PT_LIMITRATE piShm=NULL;
+	
+	// Allocate & attach the share memory for limit rate.
+	if (-1 == (idShm = shmget(IKEY_SHM_LIMITRATE_SERVER, NB_SHM_LIMITRATE_SERVER, SHM_R | SHM_W)))
+	{
+		iRet = -errno;
+		rsyserr(FERROR, iRet, "Can't get %d bytes share memory. Rsync daemon doesn't exist but all function will work normally.(%d)\n", NB_SHM_LIMITRATE_SERVER, iRet);
+		goto exit_thread;
+	}	
+	if (NULL == (piShm = (PT_LIMITRATE)shmat(idShm, NULL, 0)))
+	{
+		iRet = -errno;
+		rsyserr(FERROR, iRet, "Can't attach a %d bytes share memory! (%d)\n", NB_SHM_LIMITRATE_SERVER, iRet);
+		goto exit_thread;
+	}
+	
+	for (idx=0; idx<CN_BWLIMIT_SLOT; idx++)
+	{
+		if(-1 == piShm[idx].idPID)
+		{
+			piShm[idx].idPID = getpid();
+			piShm[idx].bSender = am_sender;
+			piShm[idx].cbSBwlimit = 0;
+			piShm[idx].cbRBwlimit = 0;
+			break;
+		}
+	}
+	
+	while(!g_bAbort && !g_bDRateChild)
+	{
+		daemon_bwlimit = bwlimit = am_sender ? (piShm[idx].cbSBwlimit >> 10) : (piShm[idx].cbRBwlimit >> 10);
+		bwlimit_writemax = (size_t)bwlimit << 7;
+		msleep(1000);
+	}
+exit_thread:
+	if (NULL != piShm)  shmdt(piShm);
+	pthread_exit(NULL);
+}
+#endif /* QNAPNAS && SUPPORT_LIMITRATE */
+
 static void do_server_sender(int f_in, int f_out, int argc, char *argv[])
 {
 	struct file_list *flist;
 	char *dir = argv[0];
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+	int iRet=0, idx;
+	pthread_t thLimitRateIDChild=-1;
+	g_bDRateChild = FALSE;
+	//jeff modify 2012.06.27, if execute rysnc alone but not by QNAP job, we can't set limit rate.(let power users use --bwlimit in command line)
+	if(g_bQnapBwlimit)
+	{
+		// Launch an additional thread to handle the band width related variables to the share memory.
+		if (0 != pthread_create(&thLimitRateIDChild, NULL, Update_LimitRate_Child_Thread, &idx))
+		{
+			rsyserr(FERROR, errno, "Can't create a thread to moniter limit rate!");
+		}
+	}
+	#endif
 
 	if (verbose > 2) {
 		rprintf(FINFO, "server_sender starting pid=%ld\n",
@@ -690,22 +1048,37 @@ static void do_server_sender(int f_in, int f_out, int argc, char *argv[])
 
 	if (am_daemon && lp_write_only(module_id)) {
 		rprintf(FERROR, "ERROR: module is write only\n");
+		#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+		iRet = RERR_SYNTAX;
+		goto exit_sender;
+		#else
 		exit_cleanup(RERR_SYNTAX);
 		return;
+		#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 	}
 	if (am_daemon && lp_read_only(module_id) && remove_source_files) {
 		rprintf(FERROR,
 		    "ERROR: --remove-%s-files cannot be used with a read-only module\n",
 		    remove_source_files == 1 ? "source" : "sent");
+		#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+		iRet = RERR_SYNTAX;
+		goto exit_sender;
+		#else
 		exit_cleanup(RERR_SYNTAX);
 		return;
+		#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 	}
 
 	if (!relative_paths) {
 		if (!change_dir(dir, CD_NORMAL)) {
 			rsyserr(FERROR, errno, "change_dir#3 %s failed",
 				full_fname(dir));
+			#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+			iRet = RERR_FILESELECT;
+			goto exit_sender;
+			#else
 			exit_cleanup(RERR_FILESELECT);
+			#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 		}
 	}
 	argc--;
@@ -719,7 +1092,12 @@ static void do_server_sender(int f_in, int f_out, int argc, char *argv[])
 
 	flist = send_file_list(f_out,argc,argv);
 	if (!flist || flist->used == 0)
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+		goto exit_sender;
+	#else
 		exit_cleanup(0);
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
+	
 
 	io_start_buffering_in(f_in);
 
@@ -729,15 +1107,28 @@ static void do_server_sender(int f_in, int f_out, int argc, char *argv[])
 	if (protocol_version >= 24)
 		read_final_goodbye(f_in);
 	io_flush(FULL_FLUSH);
-	exit_cleanup(0);
-}
 
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+exit_sender:
+	g_bDRateChild = TRUE;
+	if(-1 != (int)thLimitRateIDChild)
+		pthread_join(thLimitRateIDChild, NULL);
+	exit_cleanup(iRet);
+	#else
+	exit_cleanup(0);
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
+}
 
 static int do_recv(int f_in, int f_out, char *local_name)
 {
 	int pid;
 	int exit_code = 0;
 	int error_pipe[2];
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+	int iRet=0, idx;
+	pthread_t thLimitRateIDChild=-1;
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
+	
 
 	/* The receiving side mustn't obey this, or an existing symlink that
 	 * points to an identical file won't be replaced by the referent. */
@@ -760,7 +1151,38 @@ static int do_recv(int f_in, int f_out, char *local_name)
 		exit_cleanup(RERR_IPC);
 	}
 
+// BUG #13663: mkstemp() will hung on NTFS if the filename with ':' char.
+#ifdef QNAPNAS
+	{
+		#include <sys/vfs.h>
+		struct statfs  tStatFS;
+		if (0 == statfs(".", &tStatFS))
+		{
+			g_bNTFS = (0x5346544EL == tStatFS.f_type);
+			//printf("!!! FS type: 0x%X, ID: 0x%X, 0x%X\n", (int)tStatFS.f_type, ((int*)(&tStatFS.f_fsid))[0], ((int*)(&tStatFS.f_fsid))[1]);
+		}
+	}
+#endif	//QNAPNAS
+
 	if (pid == 0) {
+		// jeff modify 2011.8.26, for limit band width. store the pid of child process.
+		#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+		g_bDRateChild = FALSE;
+		// jeff modify 2013.11.21, function do_recv is shared by rsync client and daemon. if daemon runs,
+		// it should create limit-rate thread to throttle band width as receiving file. if client runs,
+		// it'll use do_recv to receive file list "under share folder layer", so we can't create limit-rate
+		// thread when rsync is client. But! we can't put the code "create limit-rate thread" in function
+		// do_server_recv, cause's we should throttle band width after "fork".
+		if (am_daemon && g_bQnapBwlimit)
+		{
+			// Launch an additional thread to handle the band width related variables to the share memory.
+			if (0 != pthread_create(&thLimitRateIDChild, NULL, Update_LimitRate_Child_Thread, &idx))
+			{
+				rsyserr(FERROR, errno, "Can't create a thread to moniter limit rate!");
+			}
+		}
+		#endif /* QNAPNAS && SUPPORT_LIMITRATE */
+		
 		am_receiver = 1;
 
 		close(error_pipe[0]);
@@ -797,8 +1219,22 @@ static int do_recv(int f_in, int f_out, char *local_name)
 
 			rprintf(FERROR, "Invalid packet at end of run [%s]\n",
 				who_am_i());
+			#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+			iRet = RERR_PROTOCOL;
+			goto exit_child;
+			#else
 			exit_cleanup(RERR_PROTOCOL);
+			#endif /* QNAPNAS && SUPPORT_LIMITRATE */
+			
 		}
+		#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+exit_child:
+		g_bDRateChild = TRUE;
+		if(-1 != (int)thLimitRateIDChild)
+			pthread_join(thLimitRateIDChild, NULL);
+		if(0 != iRet)
+			exit_cleanup(iRet);
+		#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 
 		/* Finally, we go to sleep until our parent kills us with a
 		 * USR2 signal.  We sleep for a short time, as on some OSes
@@ -951,6 +1387,56 @@ int child_main(int argc, char *argv[])
 	return 0;
 }
 
+#ifdef QTS_SNAPSHOT
+//input decryption_path, encryption_path_size
+//output encryption_path
+static void path_dec2enc_folder(IN char* decryption_path, OUT char* encryption_path,IN int encryption_path_size)
+{
+        int last_match_idx=0;
+        int i=0, len=strlen(decryption_path);
+        char *folder_name;
+        
+        for(i=0;i<len;i++)
+        {
+            if(decryption_path[i]=='/')            
+            {                
+                last_match_idx=i;            
+            }
+        }
+        folder_name = decryption_path;
+        folder_name = folder_name+ last_match_idx +1;
+        
+        strncpy(encryption_path, decryption_path, last_match_idx+1);
+        encryption_path[last_match_idx+1]='\0';
+        strcat(encryption_path, ".__eN__");
+        strcat(encryption_path, folder_name);
+}
+
+//input share path
+//0:no, 1:yes
+static int isFolderEncryption_self(char *share_path)
+{
+    char tmp_share_path[256];
+    char enc_path[256];
+    int ret =0;
+    struct stat st;
+    snprintf(tmp_share_path, sizeof(tmp_share_path), "%s", share_path);
+     
+    if(tmp_share_path[strlen(tmp_share_path)-1]=='/')  //end with 
+            tmp_share_path[strlen(tmp_share_path)-1]='\0';
+    
+
+    path_dec2enc_folder(tmp_share_path, enc_path, sizeof(enc_path));
+
+
+    if (stat(enc_path, &st) == 0)
+        ret =1 ;
+    
+    return ret;
+}
+
+#endif
+
 
 void start_server(int f_in, int f_out, int argc, char *argv[])
 {
@@ -984,6 +1470,24 @@ int client_run(int f_in, int f_out, pid_t pid, int argc, char *argv[])
 	struct file_list *flist = NULL;
 	int exit_code = 0, exit_code2 = 0;
 	char *local_name = NULL;
+#ifdef QNAPNAS
+	int ret;
+#endif
+
+#ifdef QTS_SNAPSHOT
+        int qret;
+        int bUseSnapshot;
+        int i, j, qpid;
+        int vol_id, snapshot_id=0;
+        char *path = NULL;
+        char *new_path = NULL;
+        char *share_path = NULL;
+        char *pszSlash = NULL, *pszShare = NULL;
+        char snapshot_path[256];
+        Snapshot_Create_CONFIG conf;
+        int *vol_idAry = NULL;
+        int *snapshot_idAry = NULL;
+#endif
 
 	cleanup_child_pid = pid;
 	if (!read_batch) {
@@ -1005,6 +1509,21 @@ int client_run(int f_in, int f_out, pid_t pid, int argc, char *argv[])
 	set_blocking(STDERR_FILENO);
 
 	if (am_sender) {
+
+#ifdef	RSYNC_PROGRESS
+		extern char  *pszSchedule;
+		if (pszSchedule)
+		{
+			// Create a report sender thread.
+			if (0 <= argc) g_ttParam.pszpTree = argv[0];
+			if (0 != pthread_create(&g_tThread, NULL, Tree_Scan_Thread, &g_ttParam))
+			{
+				if (g_bDbgProg)  printf("rsync: Can't create scan tree thread error! (%d)\n", -errno);
+				g_ttParam.bDone = 2;
+			}
+		}
+#endif	//RSYNC_PROGRESS
+
 		keep_dirlinks = 0; /* Must be disabled on the sender. */
 		if (protocol_version >= 30)
 			io_start_multiplex_out();
@@ -1018,6 +1537,102 @@ int client_run(int f_in, int f_out, pid_t pid, int argc, char *argv[])
 
 		if (write_batch && !am_server)
 			start_write_batch(f_out);
+#ifdef QTS_SNAPSHOT
+//take snapshot and change argv path here
+		bUseSnapshot = g_bSnapshot;
+		if (!bUseSnapshot)
+                        goto EXIT_MALLOC_FAIL;
+		bUseSnapshot = NAS_Snapshot_Is_Supported();
+		if (!bUseSnapshot)
+                        goto EXIT_MALLOC_FAIL;
+                vol_idAry = malloc(sizeof(int)*argc);
+                snapshot_idAry = malloc(sizeof(int)*argc);
+                if (!vol_idAry || !snapshot_idAry) {
+                        bUseSnapshot = 0;
+			if(vol_idAry) { free(vol_idAry); vol_idAry = NULL; }
+			if(snapshot_idAry) { free(snapshot_idAry); snapshot_idAry = NULL; }
+                        goto EXIT_MALLOC_FAIL;
+                }
+
+                memset(vol_idAry, 0, sizeof(int)*argc);
+                memset(snapshot_idAry, 0, sizeof(int)*argc);
+
+                for (i=0; i<argc; i++) {
+                        path = NULL;
+                        share_path = NULL;
+                        path = malloc(sizeof(char)*(strlen(argv[i])+1));
+                        share_path = malloc(sizeof(char)*(strlen(argv[i])+1));
+
+                        if (path && share_path) {
+                                strcpy(path, argv[i]);
+                                if(isFolderEncryption_self(path) == 1) //it is a encryption share folder not take snapshot
+                                    continue;
+                                if (path[strlen(path)-1] == '/')
+                                        path[strlen(path)-1] = '\0';
+                                //20171110 bug 114787 sub folder pair not got snapshot.
+                                pszShare = strstr(path,"/share/");
+                                if (pszShare && strlen(path) > 7) {
+                                        pszShare += 7;
+                                } else {
+                                        pszShare = path;
+                                }
+                                if(NULL != (pszSlash = strchr(pszShare, '/'))) {
+                                        strcpy(share_path, (pszSlash+1));
+                                        *pszSlash = '\0';
+                                }
+                                rprintf(FINFO,"snapshot volume path[%s]\n", path);
+                                if (!Volume_Get_Vol_ID_By_Mount_Path(path, &vol_id) && NAS_Snapshot_Volume_Is_Supported(vol_id)) {
+                                        vol_idAry[i] = vol_id;
+                                } else {//vol_id==0; not to take a snapshot
+					rprintf(FINFO,"not to take a snapshot\n");
+					if(path) { free(path); path = NULL; }
+					if(share_path) { free(share_path); share_path = NULL; }
+					continue;
+				}
+
+                                memset(&conf, 0, sizeof(Snapshot_Create_CONFIG));
+#ifdef	RSYNC_PROGRESS
+				if (pszSchedule)
+					snprintf(conf.name, sizeof(conf.name), "Replication-%s", pszSchedule);
+				else
+#endif
+					snprintf(conf.name, sizeof(conf.name), "Replication-%s", "Job");
+
+                                snapshot_id = 0;
+                                for (j=0; j<i; j++) { //search previous vol_id and snapshot_id
+                                        if ((vol_idAry[j]==vol_id) && (snapshot_idAry[j]!=0)) { //got previously used snapshot; reuse it
+                                                snapshot_id = snapshot_idAry[j];
+                                                break;
+                                        }
+                                }
+                                if (!snapshot_id) {
+                                        snapshot_id = NAS_Snapshot_Create_For_App(vol_id, &conf);
+                                        if (snapshot_id > 0) { //create and then set config
+                                                qpid = getpid();
+						qret = NAS_Snapshot_Mount(snapshot_id);
+						qret |= NAS_Snapshot_Mount_Msg(snapshot_id, MSG_JB);
+                                                qret |= Snapshot_Set_PID(snapshot_id, qpid);
+                                                snapshot_idAry[i] = snapshot_id;
+                                        }
+                                }
+
+                                if (snapshot_id>0 && qret==0) { //path to snapshot path
+                                        NAS_Snapshot_Get_Preview_Path(snapshot_id, snapshot_path, sizeof(snapshot_path));
+					new_path = NULL;
+                                        new_path = malloc(sizeof(char)*(strlen(snapshot_path)+strlen(share_path)+3));
+					if (new_path) {
+	                                        sprintf(new_path, "%s/%s/", snapshot_path, share_path);
+        	                                free(argv[i]);
+                	                        argv[i] = strdup(new_path);
+					}
+                                }
+                        }
+                        if(path) { free(path); path = NULL; }
+                        if(share_path) { free(share_path); share_path = NULL; }
+                        if(new_path) {free(new_path); new_path = NULL;}
+                }
+EXIT_MALLOC_FAIL:
+#endif
 		flist = send_file_list(f_out, argc, argv);
 		if (verbose > 3)
 			rprintf(FINFO,"file list sent\n");
@@ -1026,7 +1641,27 @@ int client_run(int f_in, int f_out, pid_t pid, int argc, char *argv[])
 			io_start_multiplex_in();
 
 		io_flush(NORMAL_FLUSH);
+
+#ifdef QNAPNAS
+		ret = send_files(f_in, f_out);
+#else
 		send_files(f_in, f_out);
+#endif
+
+#ifdef QTS_SNAPSHOT
+//delete snapshot here
+		if (bUseSnapshot) {
+			for (i=0; i<argc; i++) {
+				snapshot_id = snapshot_idAry[i];
+				//Strange!!! The last snapshot will not be deleted; the process is killed at that time;However, qsnapman will delete unused snapshot
+				if (snapshot_id > 0)
+					Snapshot_Set_Expiremin(snapshot_id, 1);
+			}
+			if(vol_idAry) { free(vol_idAry); vol_idAry = NULL; }
+			if(snapshot_idAry) { free(snapshot_idAry); snapshot_idAry = NULL; }
+		}
+#endif
+
 		io_flush(FULL_FLUSH);
 		handle_stats(-1);
 		if (protocol_version >= 24)
@@ -1039,6 +1674,11 @@ int client_run(int f_in, int f_out, pid_t pid, int argc, char *argv[])
 		}
 		output_summary();
 		io_flush(FULL_FLUSH);
+#ifdef QNAPNAS
+		if(!do_xfers)
+			return ret;
+		else
+#endif
 		exit_cleanup(exit_code);
 	}
 
@@ -1098,6 +1738,287 @@ static int copy_argv(char *argv[])
 	return 0;
 }
 
+#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+#ifdef QNAP_CLIENT_LIMITRATE_BY_THREAD
+/**
+ * \brief	Update the band width value from config file
+ * \param	pVoid	The buffer of daemon info.
+ */
+void* Update_LimitRate_Client_Thread(void *pVoid)
+{
+	#define MSEC_PER_SECOND 1000
+	#define CBMAX_CONF_PATH 128
+	int iRet, mfMask=IN_ONESHOT|IN_MOVE|IN_DELETE|IN_MODIFY, fdiNotify=-1, idNotify=-1, bDirty=FALSE;
+	char  szBufVnt[sizeof(struct inotify_event)+CBMAX_CONF_PATH], szSLimitRate[11], szRLimitRate[11];
+	//char *pszSchedule = (char *)pVoid;
+	struct inotify_event  *ptinEvent=(struct inotify_event*)&szBufVnt;
+	struct stat  tStat;
+	time_t itModify=0;
+	
+	// Initial the inotify first.
+	if (-1 == (fdiNotify = inotify_init()))
+	{
+		iRet = -errno;
+		rsyserr(FERROR, errno, "Can't init inotify device file! (%d)", iRet);
+		goto exit_thread;
+	}
+	// Add inotify watch to this conf file.
+	if (-1 == (idNotify = inotify_add_watch(fdiNotify, RSYNC_SCHEDULE_CONF, mfMask)))
+	{
+		iRet = -errno;
+		rsyserr(FERROR, errno, "Can't add an inotify watch of \"%s\" error! (%d)", RSYNC_SCHEDULE_CONF, iRet);
+		goto exit_thread;
+	}
+
+	// The main loop of QSync monitor.
+	while (!g_bAbort && !g_bRate)
+	{
+		// Check if there is an inotify event!
+		if (0 < (iRet = Is_FD_Ready_To_Read(fdiNotify, MSEC_PER_SECOND)))
+		{
+			memset(szBufVnt, 0, sizeof(szBufVnt));
+			if (-1 == read(fdiNotify, ptinEvent, sizeof(szBufVnt)))
+			{
+				iRet = -errno;
+				rsyserr(FERROR, errno, "Can't read the inotify event error! (%d)\n", iRet);
+				break;
+			}
+			//DEBUG_PRINTF("inotify - wd: %d, mask: 0x%X, cookie: 0x%X, len: %d, name: %s\n", ptinEvent->wd, ptinEvent->mask, ptinEvent->cookie, ptinEvent->len, ptinEvent->name);
+
+			// Check if conf file is modified.
+			if (ptinEvent->wd == idNotify)
+			{
+				bDirty = TRUE;
+				if (IN_IGNORED & ptinEvent->mask)  idNotify = -1;
+				//DEBUG_PRINTF("%s is modified!\n", ptsfConf->szpConf);
+			}
+			continue;
+		}
+		// Catched a signal?
+		else if (-EINTR == iRet)
+		{
+			// Don't exit if the signal is not an INT event.
+			if (-EINTR != g_bAbort)
+			{
+				iRet = 0;
+				continue;
+			}
+			//DEBUG_PRINTF("Catch a INT signal!\n");
+			break;
+		}
+		// Encounter error!
+		else if (0 > iRet)
+		{
+			if(-EINTR == iRet)
+			rsyserr(FERROR, iRet, "Check inotify device error! (%d)\n", iRet);
+			break;
+		}
+		// No inotify event is found till timeout.
+		else
+		{
+			// In case the inotify mechanism failed, we also check the modified time of the conf files.
+			stat(RSYNC_SCHEDULE_CONF, &tStat);
+			// In case the inotify mechanism failed, we also check the modified time of the conf file.
+			if (!bDirty)
+			{
+				// Check if the modified time of the conf file was changed or not.
+				if (tStat.st_mtime != itModify)
+				{
+					if ((-1 != idNotify) && (-1 == inotify_rm_watch(fdiNotify, idNotify)))
+					{
+						//rsyserr(FERROR, errno, "Can't remove the inotify watch of \"%s\" %d error! (%d)\n", RSYNC_SCHEDULE_CONF, idNotify, -errno);
+					}
+					idNotify = -1;
+					bDirty = TRUE;
+				}
+			}
+			itModify = tStat.st_mtime;
+		}
+		if(TRUE == bDirty)
+		{
+			// Read the conf file.
+			if (0 != Conf_Get_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNCD_SLIMITRATE, szSLimitRate, sizeof(szSLimitRate)))  strcpy(szSLimitRate, SZV_RSYNCD_SLIMITRATE_DEF);
+			if (0 != Conf_Get_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNCD_RLIMITRATE, szRLimitRate, sizeof(szRLimitRate)))  strcpy(szRLimitRate, SZV_RSYNCD_RLIMITRATE_DEF);
+
+			// Add inotify watch to this conf file.
+			if (-1 == (idNotify = inotify_add_watch(fdiNotify, RSYNC_SCHEDULE_CONF, mfMask)))
+			{
+				iRet = -errno;
+				rsyserr(FERROR, iRet, "Can't add an inotify watch of \"%s\" error! (%d)\n", RSYNC_SCHEDULE_CONF, iRet);
+				goto exit_thread;
+			}
+			bDirty = FALSE;
+		}
+		
+		am_sender ? (bwlimit = atoi(szSLimitRate) >> 10) : (bwlimit = atoi(szRLimitRate) >> 10);
+		
+		if (bwlimit) {
+			bwlimit_writemax = (size_t)bwlimit * 128;
+			if (bwlimit_writemax < 512)
+				bwlimit_writemax = 512;
+		}
+		else
+			bwlimit_writemax = 0;
+	}
+exit_thread:
+	if(fdiNotify != -1)
+	{
+		if(idNotify != -1)
+			inotify_rm_watch(fdiNotify, idNotify);
+		close(fdiNotify);
+	}
+	pthread_exit(NULL);
+}
+#else
+/**
+ * \brief	Fork a process to monitor limit rate.
+ * \param	pszSchedule	Schedule file to monitor.
+ * \return	pid of child process.
+ */
+int Fork_Monitor_LimitRate(char *pszSchedule)
+{
+	int pid=-1;
+	pid = fork();
+	
+	//child
+	if(0 == pid)
+	{
+		#define MSEC_PER_SECOND 1000
+		#define CBMAX_CONF_PATH 128
+		int iRet=0, mfMask=IN_ONESHOT|IN_MOVE|IN_DELETE|IN_MODIFY, fdiNotify=-1, idNotify=-1, bDirty=FALSE, idPPid=-1;
+		char  szBufVnt[sizeof(struct inotify_event)+CBMAX_CONF_PATH], szSLimitRate[11]={0}, szRLimitRate[11]={0}, szSLimitOld[11]={0}, szRLimitOld[11]={0};
+		//char *pszSchedule = (char *)pVoid;
+		struct inotify_event  *ptinEvent=(struct inotify_event*)&szBufVnt;
+		struct stat  tStat;
+		time_t itModify=0;
+
+		idPPid = getppid();
+
+		if (0 >= idPPid)
+		{
+			iRet = ESRCH;
+			goto exit_child;
+		}
+		if (0 != (iRet = kill(idPPid, 0)))
+			goto exit_child;
+		
+		// Initial the inotify first.
+		if (-1 == (fdiNotify = inotify_init()))
+		{
+			iRet = errno;
+			rsyserr(FERROR, errno, "Can't init inotify device file! (%d)", iRet);
+			goto exit_child;
+		}
+		// Add inotify watch to this conf file.
+		if (-1 == (idNotify = inotify_add_watch(fdiNotify, RSYNC_SCHEDULE_CONF, mfMask)))
+		{
+			iRet = errno;
+			rsyserr(FERROR, errno, "Can't add an inotify watch of \"%s\" error! (%d)", RSYNC_SCHEDULE_CONF, iRet);
+			goto exit_child;
+		}
+
+		// The main loop of QSync monitor.
+		while (!g_bAbort && !g_bRate)
+		{
+			// if parent died, child exits.
+			if (0 != (iRet = kill(idPPid, 0)))
+				goto exit_child;
+			
+			// Check if there is an inotify event!
+			if (0 < (iRet = Is_FD_Ready_To_Read(fdiNotify, MSEC_PER_SECOND)))
+			{
+				memset(szBufVnt, 0, sizeof(szBufVnt));
+				if (-1 == read(fdiNotify, ptinEvent, sizeof(szBufVnt)))
+				{
+					iRet = errno;
+					rsyserr(FERROR, errno, "Can't read the inotify event error! (%d)\n", iRet);
+					break;
+				}
+				//DEBUG_PRINTF("inotify - wd: %d, mask: 0x%X, cookie: 0x%X, len: %d, name: %s\n", ptinEvent->wd, ptinEvent->mask, ptinEvent->cookie, ptinEvent->len, ptinEvent->name);
+
+				// Check if conf file is modified.
+				if (ptinEvent->wd == idNotify)
+				{
+					bDirty = TRUE;
+					if (IN_IGNORED & ptinEvent->mask)  idNotify = -1;
+					//DEBUG_PRINTF("%s is modified!\n", ptsfConf->szpConf);
+				}
+				continue;
+			}
+			// Catched a signal?
+			else if (EINTR == iRet)
+			{
+				// Don't exit if the signal is not an INT event.
+				if (EINTR != g_bAbort)
+				{
+					iRet = 0;
+					continue;
+				}
+				//DEBUG_PRINTF("Catch a INT signal!\n");
+				break;
+			}
+			// Encounter error!
+			else if (0 > iRet)
+			{
+				if(EINTR == iRet)
+				rsyserr(FERROR, iRet, "Check inotify device error! (%d)\n", iRet);
+				break;
+			}
+			// No inotify event is found till timeout.
+			else
+			{
+				stat(RSYNC_SCHEDULE_CONF, &tStat);
+				// In case the inotify mechanism failed, we also check the modified time of the conf file.
+				if (!bDirty)
+				{
+					// Check if the modified time of the conf file was changed or not.
+					if (tStat.st_mtime != itModify)
+					{				
+						if ((-1 != idNotify) && (-1 == inotify_rm_watch(fdiNotify, idNotify)))
+						{
+							//rsyserr(FERROR, errno, "Can't remove the inotify watch of \"%s\" %d error! (%d)\n", RSYNC_SCHEDULE_CONF, idNotify, -errno);
+						}
+						idNotify = -1;
+						bDirty = TRUE;
+					}
+				}
+				itModify = tStat.st_mtime;
+			}
+			if(TRUE == bDirty)
+			{
+				// Read the conf file.
+				if (0 != Conf_Get_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNCD_SLIMITRATE, szSLimitRate, sizeof(szSLimitRate)))  strcpy(szSLimitRate, SZV_RSYNCD_SLIMITRATE_DEF);
+				if (0 != Conf_Get_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNCD_RLIMITRATE, szRLimitRate, sizeof(szRLimitRate)))  strcpy(szRLimitRate, SZV_RSYNCD_RLIMITRATE_DEF);
+
+				// Add inotify watch to this conf file.
+				if (-1 == (idNotify = inotify_add_watch(fdiNotify, RSYNC_SCHEDULE_CONF, mfMask)))
+				{
+					iRet = errno;
+					rsyserr(FERROR, iRet, "Can't add an inotify watch of \"%s\" error! (%d)\n", RSYNC_SCHEDULE_CONF, iRet);
+					goto exit_child;
+				}
+				bDirty = FALSE;
+				if((0 != memcmp(szSLimitRate, szSLimitOld, sizeof(szSLimitRate))) || (0 != memcmp(szRLimitRate, szRLimitOld, sizeof(szRLimitRate))))
+				{
+					kill(idPPid, SIGRATE);
+					memcpy(szSLimitOld, szSLimitRate, sizeof(szSLimitRate));
+					memcpy(szRLimitOld, szRLimitRate, sizeof(szRLimitRate));
+				}
+			}
+		}
+	exit_child:
+		if(fdiNotify != -1)
+		{
+			if(idNotify != -1)
+				inotify_rm_watch(fdiNotify, idNotify);
+			close(fdiNotify);
+		}
+		exit(iRet);
+	}
+	return pid;
+}
+#endif /* QNAP_CLIENT_LIMITRATE_BY_THREAD */
+#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 
 /**
  * Start a client for either type of remote connection.  Work out
@@ -1115,11 +2036,38 @@ static int start_client(int argc, char *argv[])
 	int f_in, f_out;
 	int ret;
 	pid_t pid;
+	// jeff modify 2011.8.26, for limit band width.
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+	extern char *pszSchedule;	// current schedule name
+	#ifdef QNAP_CLIENT_LIMITRATE_BY_THREAD
+	pthread_t thLimitRateID=-1;
+	//jeff modify 2012.06.27, if execute rysnc alone but not by QNAP job, we can't set limit rate.(let power users use --bwlimit in command line)
+	if(g_bQnapBwlimit)
+	{
+		// Launch an additional thread to handle the band width related variables to the share memory.
+		if (0 != pthread_create(&thLimitRateID, NULL, Update_LimitRate_Client_Thread, pszSchedule))
+		{
+			rsyserr(FERROR, errno, "Can't create a thread to moniter limit rate!");
+		}
+	}
+	#else
+	if(g_bQnapBwlimit)
+	{
+		Signal_Handler_SigRate(SIGRATE);//bug 107860 update "bwlimit" variable immediately
+		if(-1 == Fork_Monitor_LimitRate(pszSchedule))
+			rsyserr(FERROR, errno, "Can't fork a process to moniter limit rate!");
+	}
+	#endif /* QNAP_CLIENT_LIMITRATE_BY_THREAD */
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 
 	/* Don't clobber argv[] so that ps(1) can still show the right
 	 * command line. */
 	if ((ret = copy_argv(argv)) != 0)
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+		goto exit;
+	#else
 		return ret;
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 
 	if (!read_batch) { /* for read_batch, NO source is specified */
 		char *path = check_for_hostspec(argv[0], &shell_machine, &rsync_port);
@@ -1135,7 +2083,15 @@ static int start_client(int argc, char *argv[])
 			else if (check_for_hostspec(*argv, &dummy_host, &dummy_port)) {
 				rprintf(FERROR,
 					"The source and destination cannot both be remote.\n");
+				if ((ret = copy_argv(argv)) != 0)
+				#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+				{
+					ret = RERR_SYNTAX;
+					goto exit_clean;
+				}
+				#else
 				exit_cleanup(RERR_SYNTAX);
+				#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 			} else {
 				remote_argc--; /* don't count dest */
 				argc = 1;
@@ -1144,7 +2100,12 @@ static int start_client(int argc, char *argv[])
 			    && strcmp(filesfrom_host, shell_machine) != 0) {
 				rprintf(FERROR,
 					"--files-from hostname is not the same as the transfer hostname\n");
+				#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+					ret = RERR_SYNTAX;
+					goto exit_clean;
+				#else
 				exit_cleanup(RERR_SYNTAX);
+				#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 			}
 			am_sender = 0;
 			if (rsync_port)
@@ -1167,14 +2128,24 @@ static int start_client(int argc, char *argv[])
 			    && strcmp(filesfrom_host, shell_machine) != 0) {
 				rprintf(FERROR,
 					"--files-from hostname is not the same as the transfer hostname\n");
+				#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+					ret = RERR_SYNTAX;
+					goto exit_clean;
+				#else
 				exit_cleanup(RERR_SYNTAX);
+				#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 			}
 			if (!path) { /* no hostspec found, so src & dest are local */
 				local_server = 1;
 				if (filesfrom_host) {
 					rprintf(FERROR,
 						"--files-from cannot be remote when the transfer is local\n");
+					#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+						ret = RERR_SYNTAX;
+						goto exit_clean;
+					#else
 					exit_cleanup(RERR_SYNTAX);
+					#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 				}
 				shell_machine = NULL;
 			} else { /* hostspec was found, so dest is remote */
@@ -1187,7 +2158,12 @@ static int start_client(int argc, char *argv[])
 		local_server = 1;
 		if (check_for_hostspec(argv[argc-1], &shell_machine, &rsync_port)) {
 			rprintf(FERROR, "remote destination is not allowed with --read-batch\n");
+			#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+				ret = RERR_SYNTAX;
+				goto exit_clean;
+			#else
 			exit_cleanup(RERR_SYNTAX);
+			#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 		}
 		remote_argv = argv += argc - 1;
 		remote_argc = argc = 1;
@@ -1201,7 +2177,12 @@ static int start_client(int argc, char *argv[])
 		for (i = 1; i < argc; i++) {
 			if (check_for_hostspec(argv[i], &dummy_host, &dummy_port)) {
 				rprintf(FERROR, "Unexpected remote arg: %s\n", argv[i]);
+				#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+					ret = RERR_SYNTAX;
+					goto exit_clean;
+				#else
 				exit_cleanup(RERR_SYNTAX);
+				#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 			}
 		}
 	} else {
@@ -1238,13 +2219,23 @@ static int start_client(int argc, char *argv[])
 	if (password_file && !daemon_over_rsh) {
 		rprintf(FERROR, "The --password-file option may only be "
 				"used when accessing an rsync daemon.\n");
+		#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+			ret = RERR_SYNTAX;
+			goto exit_clean;
+		#else
 		exit_cleanup(RERR_SYNTAX);
+		#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 	}
 
 	if (connect_timeout) {
 		rprintf(FERROR, "The --contimeout option may only be "
 				"used when connecting to an rsync daemon.\n");
+		#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+			ret = RERR_SYNTAX;
+			goto exit_clean;
+		#else
 		exit_cleanup(RERR_SYNTAX);
+		#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 	}
 
 	if (shell_machine) {
@@ -1271,7 +2262,14 @@ static int start_client(int argc, char *argv[])
 		int tmpret;
 		tmpret = start_inband_exchange(f_in, f_out, shell_user, remote_argc, remote_argv);
 		if (tmpret < 0)
+		#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+		{
+			ret = tmpret;
+			goto exit;
+		}
+		#else
 			return tmpret;
+		#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 	}
 
 	ret = client_run(f_in, f_out, pid, argc, argv);
@@ -1279,6 +2277,25 @@ static int start_client(int argc, char *argv[])
 	fflush(stdout);
 	fflush(stderr);
 
+exit_clean:
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+	// terminate thread of limit rate
+	g_bRate = TRUE;
+	#ifdef QNAP_CLIENT_LIMITRATE_BY_THREAD
+	if(-1 != (int)thLimitRateID)
+		pthread_join(thLimitRateID, NULL);
+	#endif /* QNAP_CLIENT_LIMITRATE_BY_THREAD */
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
+	exit_cleanup(ret);
+exit:
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+	// terminate thread of limit rate
+	g_bRate = TRUE;
+	#ifdef QNAP_CLIENT_LIMITRATE_BY_THREAD
+	if(-1 != (int)thLimitRateID)
+		pthread_join(thLimitRateID, NULL);
+	#endif /* QNAP_CLIENT_LIMITRATE_BY_THREAD */
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 	return ret;
 }
 
@@ -1310,6 +2327,32 @@ RETSIGTYPE remember_children(UNUSED(int val))
 	 * zombie children, maybe that's why he did it. */
 	while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
 		/* save the child's exit status */
+#ifdef QTS_SNAPSHOT
+		for (cnt = 0; cnt < pid_stat_table_size; cnt++) {
+			if (pid_stat_table[cnt].pid == 0) {
+				pid_stat_table[cnt].pid = pid;
+				pid_stat_table[cnt].status = status;
+				break;
+			}
+		}
+		if (cnt == pid_stat_table_size) { /* table is too small */
+			int tmp_pid_stat_table_size = pid_stat_table_size + MAXCHILDPROCS;
+			struct pid_status *tmp_table = NULL;
+			tmp_table = malloc(sizeof(struct pid_status)*tmp_pid_stat_table_size);
+			if (!tmp_table)
+				break;
+			memset(tmp_table, 0, sizeof(struct pid_status)*tmp_pid_stat_table_size);
+			for (cnt = 0; cnt < pid_stat_table_size; cnt++) {
+				tmp_table[cnt].pid = pid_stat_table[cnt].pid;
+				tmp_table[cnt].status = pid_stat_table[cnt].status;
+			}
+			tmp_table[cnt].pid = pid;
+			tmp_table[cnt].status = status;
+			free(pid_stat_table);
+			pid_stat_table = tmp_table;
+                        pid_stat_table_size = tmp_pid_stat_table_size;
+		}
+#else              
 		for (cnt = 0; cnt < MAXCHILDPROCS; cnt++) {
 			if (pid_stat_table[cnt].pid == 0) {
 				pid_stat_table[cnt].pid = pid;
@@ -1317,6 +2360,7 @@ RETSIGTYPE remember_children(UNUSED(int val))
 				break;
 			}
 		}
+#endif
 	}
 #endif
 #ifndef HAVE_SIGACTION
@@ -1381,6 +2425,12 @@ int main(int argc,char *argv[])
 	int ret;
 	int orig_argc = argc;
 	char **orig_argv = argv;
+
+#ifdef	QNAPNAS
+	extern char *pszSchedule;	///< current schedule name
+	extern char *pszProgressConf;
+#endif	//QNAPNAS
+
 #ifdef HAVE_SIGACTION
 # ifdef HAVE_SIGPROCMASK
 	sigset_t sigmask;
@@ -1425,6 +2475,48 @@ int main(int argc,char *argv[])
 		exit_cleanup(RERR_SYNTAX);
 	}
 
+#ifdef	QNAPNAS
+	if(pszProgressConf)
+	    rsync_conf = pszProgressConf;
+	else
+	    rsync_conf = RSYNC_DEFAULT_SCHEDULE_CONF;
+	// Lower the rsync priority.
+	 nice(5);
+
+	// reset the progress to the rsync schedule conf file
+	if (pszSchedule)
+	{
+		char  szBuf[64];
+
+		// Check if there is already a process executing for this job.
+		if (0 == Conf_Get_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNC_PID, szBuf, sizeof(szBuf)))
+		{
+			long  iPid = atol(szBuf);
+			if ((0 < iPid) && (0 == kill(iPid, 0)))
+			{
+				exit_cleanup(RERR_JOBRUNNING);
+			}
+		}
+
+		sprintf(szBuf, "%d", getpid());		
+		Conf_Set_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNC_PID, szBuf);
+		Conf_Set_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNC_PROGRESS, "0");
+		Conf_Set_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNC_REMAIN_TIME, "0");
+		Conf_Remove_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNC_PAUSED);
+
+#ifdef	RSYNC_PROGRESS
+		// Initial scan tree status.
+		{
+			extern int  g_bAbort;
+			memset(&g_ttParam, 0, sizeof(g_ttParam));
+			g_ttParam.pttStat = &stats.ttStat;
+			g_ttParam.pbAbort = &g_bAbort;
+		}
+#endif	//RSYNC_PROGRESS
+
+	}
+#endif	//QNAPNAS
+
 	SIGACTMASK(SIGINT, sig_int);
 	SIGACTMASK(SIGHUP, sig_int);
 	SIGACTMASK(SIGTERM, sig_int);
@@ -1438,6 +2530,15 @@ int main(int argc,char *argv[])
 #ifdef SIGXFSZ
 	SIGACTION(SIGXFSZ, SIG_IGN);
 #endif
+
+#ifdef	QNAPNAS
+	SIGACTION(SIGHUP, Signal_Handler_SigHup);
+#ifdef	SUPPORT_LIMITRATE
+#ifndef QNAP_CLIENT_LIMITRATE_BY_THREAD
+	SIGACTION(SIGRATE, Signal_Handler_SigRate);
+#endif  //QNAP_CLIENT_LIMITRATE_BY_THREAD
+#endif	//SUPPORT_LIMITRATE
+#endif	//QNAPNAS
 
 	/* Initialize change_dir() here because on some old systems getcwd
 	 * (implemented by forking "pwd" and reading its output) doesn't
@@ -1501,10 +2602,31 @@ int main(int argc,char *argv[])
 		start_server(STDIN_FILENO, STDOUT_FILENO, argc, argv);
 	}
 
+#ifdef QNAPNAS
+	{
+		char* pid_fileP = NULL;
+		switch(qnap_mode) {
+			case NORMAL:	pid_fileP = NORMAL_LOCK_FILE;	break;
+			case QRAID1:	pid_fileP = QRAID1_LOCK_FILE;	break;
+			case USB_COPY:	pid_fileP = USBCOPY_LOCK_FILE;	break;
+			case HD_COPY_USB:	pid_fileP = HDCOPYUSB_LOCK_FILE;	break;
+		}
+		if(pid_fileP)
+		{
+			char cmd[64];
+			sprintf(cmd, "echo %d > %s", getpid(), pid_fileP);
+			system(cmd);
+		}
+	}
+#endif
+
 	ret = start_client(argc, argv);
 	if (ret == -1)
 		exit_cleanup(RERR_STARTCLIENT);
 	else
+#ifdef QNAPNAS
+		if(do_xfers)
+#endif
 		exit_cleanup(ret);
 
 	return ret;

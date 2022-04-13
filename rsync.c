@@ -529,6 +529,11 @@ int set_file_attrs(const char *fname, struct file_struct *file, stat_x *sxp,
 	return updated;
 }
 
+
+#ifdef	RSYNC_PROGRESS
+int  g_bAbort=0;		// A flag to indicate rysn is going to exit.
+#endif	//RSYNC_PROGRESS
+
 RETSIGTYPE sig_int(UNUSED(int val))
 {
 	/* KLUGE: if the user hits Ctrl-C while ssh is prompting
@@ -539,6 +544,11 @@ RETSIGTYPE sig_int(UNUSED(int val))
 	 * chance to do the right thing.  If child processes are
 	 * not ssh waiting for a password, then this tiny delay
 	 * shouldn't hurt anything. */
+
+#ifdef	RSYNC_PROGRESS
+	g_bAbort = 1;
+#endif	//RSYNC_PROGRESS
+	
 	msleep(400);
 	exit_cleanup(RERR_SIGNAL);
 }

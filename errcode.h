@@ -47,6 +47,10 @@
 #define RERR_TIMEOUT    30      /* timeout in data send/receive */
 #define RERR_CONTIMEOUT 35      /* timeout waiting for daemon connection */
 
+#ifdef	QNAPNAS
+#define	RERR_JOBRUNNING	80		/* exit because the job is already running */
+#endif	//QNAPNAS
+
 /* Although it doesn't seem to be specified anywhere,
  * ssh and the shell seem to return these values:
  *

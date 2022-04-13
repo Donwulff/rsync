@@ -99,6 +99,11 @@ extern int backup_suffix_len;
 extern struct file_list *cur_flist, *first_flist, *dir_flist;
 extern struct filter_list_struct daemon_filter_list;
 
+#ifdef QNAPNAS
+extern int module_id;
+extern int module_id_filename_len;
+#endif	//QNAPNAS
+
 int ignore_perishable = 0;
 int non_perishable_cnt = 0;
 int maybe_ATTRS_REPORT = 0;
@@ -294,7 +299,8 @@ static enum delret delete_dir_contents(char *fname, uint16 flags)
 		}
 
 		strlcpy(p, fp->basename, remainder);
-		if (!(fp->mode & S_IWUSR) && !am_root && (uid_t)F_OWNER(fp) == our_uid)
+		//if (!(fp->mode & S_IWUSR) && !am_root && (uid_t)F_OWNER(fp) == our_uid) //20160913, kason fix rsync vulnerability issues #Bug id:88143
+		if (!(fp->mode & S_IWUSR) && !am_root && fp->flags & FLAG_OWNED_BY_US) //20160913, kason fix rsync vulnerability issues #Bug id:88143
 			do_chmod(fname, fp->mode | S_IWUSR);
 		/* Save stack by recursing to ourself directly. */
 		if (S_ISDIR(fp->mode)) {
@@ -526,7 +532,8 @@ static void delete_in_dir(char *fbuf, struct file_struct *file, dev_t *fs_dev)
 		 * a delete_item call with a DEL_MAKE_ROOM flag. */
 		if (flist_find_ignore_dirness(cur_flist, fp) < 0) {
 			int flags = DEL_RECURSE;
-			if (!(fp->mode & S_IWUSR) && !am_root && (uid_t)F_OWNER(fp) == our_uid)
+			//if (!(fp->mode & S_IWUSR) && !am_root && (uid_t)F_OWNER(fp) == our_uid) //20160913, kason fix rsync vulnerability issues #Bug id:88143 
+			if (!(fp->mode & S_IWUSR) && !am_root && fp->flags & FLAG_OWNED_BY_US) //20160913, kason fix rsync vulnerability issues #Bug id:88143 
 				flags |= DEL_NO_UID_WRITE;
 			f_name(fp, delbuf);
 			if (delete_during == 2) {
@@ -1791,8 +1798,18 @@ static void recv_generator(char *fname, struct file_struct *file, int ndx,
 #endif
 		if (stat_errno == ENOENT)
 			goto notify_others;
+		#ifdef QNAPNAS
+		if (module_id >= 0 && module_id_filename_len > 0) {
+			rsyserr(FERROR_XFER, stat_errno, "recv_generator: failed to stat %s, maximum length of filenames is %d characters",
+				full_fname(fname), module_id_filename_len);
+		} else {
 		rsyserr(FERROR_XFER, stat_errno, "recv_generator: failed to stat %s",
 			full_fname(fname));
+		}
+		#else
+		rsyserr(FERROR_XFER, stat_errno, "recv_generator: failed to stat %s",
+			full_fname(fname));
+		#endif
 		goto cleanup;
 	}
 

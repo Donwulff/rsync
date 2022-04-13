@@ -21,6 +21,19 @@
  */
 
 #include "rsync.h"
+#ifdef QNAPNAS
+#include "Util.h"
+extern int qnap_mode;
+enum { NORMAL, QRAID1, USB_COPY ,HD_COPY_USB, SNAPSHOT_COPY, SNAPSHOT_COPY_BY_SIZE, SNAPSHOT_RECEIVE_BY_SIZE};
+#endif
+
+//--req#1535, Myron Su, v4.1.2, 2014/09/08
+//Write speed data to schedule job config
+//Working on '--schedule=' option
+#ifdef QNAPNAS
+char szSpeed[20];
+#endif
+//[ok]--req#1535, Myron Su, v4.1.2, 2014/09/17
 
 extern int am_server;
 extern int need_unsorted_flist;
@@ -53,7 +66,7 @@ static unsigned long msdiff(struct timeval *t1, struct timeval *t2)
 	     + (t2->tv_usec - t1->tv_usec) / 1000;
 }
 
-
+static unsigned long long startTime, endTime;
 /**
  * @param ofs Current position in file
  * @param size Total size of file
@@ -86,7 +99,14 @@ static void rprint_progress(OFF_T ofs, OFF_T size, struct timeval *now,
 		     / diff / 1024.0;
 		remain = rate ? (double) (size - ofs) / rate / 1000.0 : 0.0;
 	}
-
+	//--Bug#89661 & Bug#96775 Bandwidth usage are inconsistent --
+	if (!startTime)
+		startTime = Tick_Diff(0);
+	double interval_tmp = ((Tick_Diff(0)-startTime)) /1000 + 0.5;
+	if (interval_tmp<=0)
+		interval_tmp = 1;
+	rate = (double) ((stats.total_written/1000) / interval_tmp);
+	//--
 	if (rate > 1024*1024) {
 		rate /= 1024.0 * 1024.0;
 		units = "GB/s";
@@ -111,9 +131,78 @@ static void rprint_progress(OFF_T ofs, OFF_T size, struct timeval *now,
 			stats.num_transferred_files,
 			stats.num_files - current_file_index - 1,
 			stats.num_files);
+#ifdef QNAPNAS
+		if(qnap_mode == QRAID1){
+			Set_Profile_Integer("QRAID1", "Progress", (int)(((current_file_index+1)*100.0)/stats.num_files));
+		}
+		if(qnap_mode == HD_COPY_USB){
+			FILE *fp;
+			fp=fopen("/tmp/hdcopyusb_process_log","w+");
+			fprintf(fp,"%2.1f%%",(double)(((current_file_index+1)*100.0)/stats.num_files));
+			fclose(fp);
+		}
+#endif
 	} else
 		strlcpy(eol, "\r", sizeof eol);
 	progress_is_active = 0;
+	
+//--req#1535, Myron Su, v4.1.2, 2014/09/08
+//Write speed data to schedule job config
+//Working on '--schedule=' option
+#ifdef QNAPNAS
+	extern char  *pszSchedule;
+	if (pszSchedule)
+		sprintf(szSpeed, "%.2f%s", rate, units);
+
+	if(qnap_mode == SNAPSHOT_COPY){
+		FILE *fp;
+		extern char *g_cProgressLog;
+		if (g_cProgressLog)
+			fp=fopen(g_cProgressLog,"w+");
+		else
+			fp=fopen("/tmp/snapshotcopy_progress_log","w+");
+		if (fp) {
+			fprintf(fp,"%2.0f",(double)(((current_file_index+1)*100.0)/stats.num_files));
+			fclose(fp);
+		}
+	}
+	else if(qnap_mode == SNAPSHOT_COPY_BY_SIZE){
+		FILE *fp;
+		extern char *g_cProgressLog;
+		if (g_cProgressLog)
+			fp=fopen(g_cProgressLog,"w+");
+		else
+			fp=fopen("/tmp/snapshotcopy_progress_log","w+");
+		if (fp) {
+                        // Bug 106077, foder size is not caculated in total_size, neglect the size
+			if (stats.total_size && stats.total_written<=stats.total_size)
+				fprintf(fp,"%d",stats.total_written*100/stats.total_size);
+			else
+				fprintf(fp,"100");
+//			fprintf(fp,"%2.1f%%",(double)((stats.total_written*100.0)/stats.total_size));
+			fclose(fp);
+		}
+	}
+	/* used by rsync over ssh to copy file to local; total_written does not increase but total_read does */
+	else if(qnap_mode == SNAPSHOT_RECEIVE_BY_SIZE){
+		FILE *fp;
+		extern char *g_cProgressLog;
+		if (g_cProgressLog)
+			fp=fopen(g_cProgressLog,"w+");
+		else
+			fp=fopen("/tmp/snapshotcopy_progress_log","w+");
+		if (fp) {
+                        // Bug 106077, foder size is not caculated in total_size, neglect the size
+			if (stats.total_size && stats.total_read<=stats.total_size)
+				fprintf(fp,"%d",stats.total_read*100/stats.total_size);
+			else
+				fprintf(fp,"100");
+			fclose(fp);
+		}
+	}
+#endif
+//[ok]--req#1535, Myron Su, v4.1.2, 2014/09/17
+
 	rprintf(FCLIENT, "%12s %3d%% %7.2f%s %s%s",
 		human_num(ofs), pct, rate, units, rembuf, eol);
 	if (!is_last)
@@ -194,3 +283,117 @@ void show_progress(OFF_T ofs, OFF_T size)
 
 	rprint_progress(ofs, size, &now, False);
 }
+
+
+#ifdef	RSYNC_PROGRESS
+
+/// variable to control the progress updating frequency
+unsigned long long  smsSent = 0;
+
+/**
+ * \brief	Get the time difference between now and the specified reference time in msec.
+ * \param	itBase		the reference time base getting by (gettimeofday() / 1000)
+ * \return	the time difference in msec
+ */
+unsigned long long Tick_Diff(unsigned long long itBase)
+{
+	struct timeval ttNow;
+	gettimeofday(&ttNow, NULL);
+	return ((ttNow.tv_sec * 1000LL + ttNow.tv_usec / 1000L) - itBase);
+}
+
+/**
+ * \brief	Update the current rsync progress to the rsync schedule file.
+ * \param	msSent		total sent time in msec
+ * \param	nbSent		total sent data in byte
+ * \param	nbSkip		total skipped data in byte
+ * \param	nbTotal		total data to be sent in byte
+ */
+void Update_Progress(int64 msSent, int64 nbSent, int64 nbSkip, int64 nbTotalRR, int64 nbTotalTT)
+{
+	int  iRet, iSpeed=0, nsRemain = 0, iProgress = 0;
+	int64  nbTotal=nbTotalRR;
+	extern int  g_bDbgProg;
+	extern char  *pszSchedule;	// current schedule name
+
+	if (nbTotal)
+	{
+		if (nbTotalTT > nbTotal)  nbTotal = nbTotalTT;
+		iSpeed = ((msSent) ? ((nbSent * 1000) / msSent) : (10 * 1024 * 1024));
+		nsRemain = (iSpeed) ? (nbTotal - (nbSent + nbSkip)) / iSpeed : 86399L;
+		if (100 > (iProgress = (((nbSent + nbSkip) * 100) / nbTotal)))  nsRemain ++;
+	}
+	// Special handle empty folders
+	else if ((-1 == msSent) && !nbSent && !nbSkip)
+	{
+		msSent = 0;
+		iProgress = 100;
+		nsRemain = 0;
+	}
+	// Update progress and remain time to rsync schedule file
+	if (pszSchedule)
+	{
+		char szBuf[64];
+		//printf("Schedule name: '%s'\n", pszSchedule);
+		sprintf(szBuf, "%d", iProgress);
+		iRet = Conf_Set_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNC_PROGRESS, szBuf);
+		if ((SUCCESS != iRet) && g_bDbgProg)  printf("rsync: Can't update rsync conf file 1!\n");
+		sprintf(szBuf, "%d", nsRemain);
+		iRet = Conf_Set_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNC_REMAIN_TIME, szBuf);
+		if ((SUCCESS != iRet) && g_bDbgProg)  printf("rsync: Can't update rsync conf file 2!\n");
+
+//--req#1535, Myron Su, v4.1.2, 2014/09/08
+//Write speed data to schedule job config
+//Working on '--schedule=' option
+		iRet = Conf_Set_Field(RSYNC_SCHEDULE_CONF, pszSchedule, SZK_RSYNC_SPEED, szSpeed);
+		if ((SUCCESS != iRet) && g_bDbgProg)  printf("rsync: Can't update rsync conf speed!\n");
+//[ok]--req#1535, Myron Su, v4.1.2, 2014/09/17
+
+		// Debug progress.
+		if (g_bDbgProg)  printf("rsync progress: %3d%%, speed:%d KB, remain: %4d sec (%lld/%lld/%lld/%lld)\n", 
+			iProgress, iSpeed>>10, nsRemain, nbSent, nbSkip, nbTotalRR, nbTotalTT);
+	}
+}
+
+/**
+ * \brief	Tell progress mechanism a file is going to send.
+ * \param	ptStats		the statistic variable of progress
+ */
+void Begin_Send_File(struct stats *ptStats)
+{
+	ptStats->msBase = Tick_Diff(0);
+}
+
+/**
+ * \brief	Tell progress mechanism the file sending progress.
+ * \param	ptStats		the statistic variable of progress
+ * \param	nbFile		the total size of the file in byte
+ * \param	nbSent		the size of the file be sent in byte
+ */
+void Sending_File(struct stats *ptStats, int64 nbFile, int64 nbSent)
+{
+	unsigned long long  msSent, msDiff, msSentTotal, nbSentTotal;
+	if (MIN_TICK_DIFF_UPDATE > (msDiff = Tick_Diff(smsSent)))  return;
+	smsSent += msDiff;
+	msSent = Tick_Diff(ptStats->msBase);
+	msSentTotal = msSent + ptStats->msSent;
+	nbSentTotal = nbSent + ptStats->nbSent;
+	Update_Progress(msSentTotal, nbSentTotal, ptStats->nbSkip, ptStats->nbTotal, ptStats->ttStat.cbFiles);
+}
+
+/**
+ * \brief	Tell progress mechanism a file was sent.
+ * \param	ptStats		the statistic variable of progress
+ * \param	nbFile		the size of the just sent file in byte
+ */
+void End_Send_File(struct stats *ptStats, int64 nbFile)
+{
+	unsigned long long  msSent = Tick_Diff(ptStats->msBase);
+	Sending_File(ptStats, nbFile, nbFile);
+	ptStats->msSent += msSent;
+	ptStats->nfDone ++;
+	ptStats->nbSent += nbFile;
+}
+
+#endif	//RSYNC_PROGRESS
+

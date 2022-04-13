@@ -60,10 +60,17 @@ extern struct filter_list_struct daemon_filter_list;
 extern char *iconv_opt;
 extern iconv_t ic_send, ic_recv;
 #endif
+#ifdef QNAPNAS
+extern int check_dest;
+#define CS_IO_TIMEOUT 1200
+#endif
 
 char *auth_user;
 int read_only = 0;
 int module_id = -1;
+#ifdef QNAPNAS //bug 126413
+int module_id_filename_len = -1;
+#endif
 int munge_symlinks = 0;
 struct chmod_mode_struct *daemon_chmod_modes;
 
@@ -80,6 +87,59 @@ static int rl_nulls = 0;
 #ifdef HAVE_SIGACTION
 static struct sigaction sigact;
 #endif
+
+#ifdef	QNAPNAS
+// Add Command to report free space of a FS by specified a rsync path.
+#include <sys/statfs.h>
+#include "Util.h"
+
+
+#define	SZK_QUERY_FREE_SPACE 	"#..QNAP.Query.Free.Space:"
+
+/**
+ * /brief	Get the free space of a file system by a specified folder.
+ * /param	pszfFolder	A path of the srync exported folder
+ * /return	The size of free space in MB if success. -ENOMEM if out-of-memory, -ENOENT if bad path.
+ */
+long Get_Free_Space(char *pszfFolder)
+{
+	long  iRet = -ENOENT, cbFolder;
+	char  *pszfShare, *pszSlash;
+	struct statfs  tsfShare;
+
+	if ('/' == *pszfFolder)  pszfFolder++;
+	cbFolder = strlen(pszfFolder);
+
+	// allocate buffer for share name
+	if (NULL == (pszfShare = malloc(PATH_MAX + cbFolder + 1)))
+	{
+		return -ENOMEM;
+	}
+
+	memcpy(pszfShare + PATH_MAX, pszfFolder, cbFolder + 1);
+	if (NULL != (pszSlash = strchr(pszfShare + PATH_MAX, '/')))  *pszSlash = 0;
+	if (0 <= Conf_Get_Field("/etc/config/rsyncd.conf", pszfShare + PATH_MAX, "path", pszfShare, PATH_MAX))
+	{
+		if (0 == (iRet = statfs(pszfShare, &tsfShare)))
+		{
+			if (tsfShare.f_bsize <= (1 << 20))
+			{
+				iRet = tsfShare.f_bfree / ((1 << 20) / tsfShare.f_bsize);
+			}
+			else
+			{
+				iRet = tsfShare.f_bfree * (tsfShare.f_bsize >> 20);
+			}
+		}
+		else
+		{
+			iRet = -errno;
+		}
+	}
+	free(pszfShare);
+	return 	iRet;
+}
+#endif	//QNAPNAS
 
 /**
  * Run a client connected to an rsyncd.  The alternative to this
@@ -126,7 +186,15 @@ int start_socket_client(char *host, int remote_argc, char *remote_argv[],
 #endif
 
 	ret = start_inband_exchange(fd, fd, user, remote_argc, remote_argv);
-
+#ifdef QNAPNAS
+	if(check_dest) {
+		if(ret == 0){
+			rprintf(FINFO, "The path \"%s\" is valid.\n", NS(remote_argv[0]));
+		}
+		return ret;
+	}
+	else
+#endif
 	return ret ? ret : client_run(fd, fd, -1, argc, argv);
 }
 
@@ -466,7 +534,9 @@ static int rsync_module(int f_in, int f_out, int i, char *addr, char *host)
 	}
 
 	module_id = i;
-
+	#ifdef QNAPNAS
+	module_id_filename_len = Get_FileSystem_Namelen(lp_name(module_id));
+	#endif
 	if (lp_read_only(i))
 		read_only = 1;
 
@@ -857,10 +927,15 @@ static int rsync_module(int f_in, int f_out, int i, char *addr, char *host)
 	if (!numeric_ids
 	 && (use_chroot ? lp_numeric_ids(i) != False : lp_numeric_ids(i) == True))
 		numeric_ids = -1; /* Set --numeric-ids w/o breaking protocol. */
-
+#ifdef QNAPNAS
+	// 2011.7.8 Jeff modified, we are getting very poor performance on large file.
+	// it's because the hash algorithm when syncing large sparse file. The client
+	// spends too much time to do hash and the daemon time out. So we enlarge io timeout.
+	set_io_timeout(CS_IO_TIMEOUT);
+#else
 	if (lp_timeout(i) && (!io_timeout || lp_timeout(i) < io_timeout))
 		set_io_timeout(lp_timeout(i));
-
+#endif
 	/* If we have some incoming/outgoing chmod changes, append them to
 	 * any user-specified changes (making our changes have priority).
 	 * We also get a pointer to just our changes so that a receiver
@@ -894,7 +969,25 @@ static void send_listing(int fd)
 	if (protocol_version >= 25)
 		io_printf(fd,"@RSYNCD: EXIT\n");
 }
+#ifdef QNAPNAS
+static void send_listing_qnap(int f_out, char *user)
+{
+	int n = lp_numservices();
+	int i;
 
+	for (i = 0; i < n; i++) {
+		if (lp_list(i))
+		{
+			int g_access=SHARE_NOACCESS;
+			g_access = Get_NAS_User_Security_For_Share(user, lp_name(i));
+			if (g_access==SHARE_READWRITE)
+				io_printf(f_out, "%-15s\t%s\n", lp_name(i), lp_comment(i));
+		}
+	}
+	if (protocol_version >= 25)
+		io_printf(f_out,"@RSYNCD: EXIT\n");
+}
+#endif
 static int load_config(int globals_only)
 {
 	if (!config_file) {
@@ -914,6 +1007,9 @@ int start_daemon(int f_in, int f_out)
 	char line[1024];
 	char *addr, *host;
 	int i;
+	#ifdef QNAPNAS
+	int bAuthList=0;
+	#endif
 
 	io_set_sock_fds(f_in, f_out);
 
@@ -940,12 +1036,56 @@ int start_daemon(int f_in, int f_out)
 	if (!read_line_old(f_in, line, sizeof line))
 		return -1;
 
+	#ifdef QNAPNAS
+	// jeff modfiy 2013.10.24, let client don't have to auth share folders one by one when creating job.
+	if(0 == strncmp(line, "#qnaplist", 9))
+	{
+		bAuthList=1;
+		line[0] = 0;
+	}
+	#endif
 	if (!*line || strcmp(line, "#list") == 0) {
+
+		#ifdef	QNAPNAS
+		// Albert 20090924: add auth check for the root shared folder
+		extern int sever_mode;
+		if (0 != sever_mode)
+		{
+			i = lp_number(line);
+			auth_user = auth_server(f_in, f_out, i, host, addr, "@RSYNCD: AUTHREQD ");
+			if (!auth_user)
+			{
+				io_printf(f_out, "@ERROR: auth failed on module %s\n", "/");
+				return -1;
+			}
+		}
+		#endif	//QNAPNAS
+
 		rprintf(FLOG, "module-list request from %s (%s)\n",
 			host, addr);
+		#ifdef QNAPNAS
+		{
+			if ((0 != sever_mode) && bAuthList)
+				send_listing_qnap(f_out, auth_user);
+			else
 		send_listing(f_out);
+		}
+		#else
+		send_listing(f_out);
+		#endif
 		return -1;
 	}
+
+	#ifdef	QNAPNAS
+	if (!*line || strncmp(line, SZK_QUERY_FREE_SPACE, strlen(SZK_QUERY_FREE_SPACE)) == 0)
+	{
+		long cmFree = Get_Free_Space(line+strlen(SZK_QUERY_FREE_SPACE));
+		rprintf(FLOG, "query free space %s (%ld) from %s (%s)\n", line+strlen(SZK_QUERY_FREE_SPACE), cmFree, host, addr);
+		io_printf(f_out, "%ld\t\n", cmFree);
+		if (protocol_version >= 25)  io_printf(f_out,"@RSYNCD: EXIT\n");
+		return -1;
+	}
+	#endif	//QNAPNAS
 
 	if (*line == '#') {
 		/* it's some sort of command that I don't understand */

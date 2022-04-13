@@ -18,6 +18,10 @@
  * with this program; if not, visit the http://fsf.org website.
  */
 
+#ifdef QNAPNAS
+#define	RSYNC_PROGRESS
+#endif //QNAPNAS
+
 #define False 0
 #define True 1
 
@@ -65,6 +69,7 @@
 /* These flags are used in the live flist data. */
 
 #define FLAG_TOP_DIR (1<<0)	/* sender/receiver/generator */
+#define FLAG_OWNED_BY_US (1<<0) /* generator: set by make_file() for aux flists only */ //20160913, kason fix rsync vulnerability issues #Bug id:88143
 #define FLAG_FILE_SENT (1<<1)	/* sender/receiver/generator */
 #define FLAG_DIR_CREATED (1<<1)	/* generator */
 #define FLAG_CONTENT_DIR (1<<2)	/* sender/receiver/generator */
@@ -85,6 +90,10 @@
 
 #define FLAG_DIVERT_DIRS (1<<16)/* sender */
 
+/* These flags are for get_dirlist(). */ //20160913, kason fix rsync vulnerability issues #Bug id:88143
+#define GDL_IGNORE_FILTER_RULES (1<<0) //20160913, kason fix rsync vulnerability issues #Bug id:88143
+
+/* Some helper macros for matching bits. */ //20160913, kason fix rsync vulnerability issues #Bug id:88143
 #define BITS_SET(val,bits) (((val) & (bits)) == (bits))
 #define BITS_SETnUNSET(val,onbits,offbits) (((val) & ((onbits)|(offbits))) == (onbits))
 #define BITS_EQUAL(b1,b2,mask) (((unsigned)(b1) & (unsigned)(mask)) \
@@ -95,7 +104,7 @@
 
 /* This is used when working on a new protocol version in CVS, and should
  * be a new non-zero value for each CVS change that affects the protocol.
- * It must ALWAYS be 0 when the protocol goes final! */
+ * It must ALWAYS be 0 when the protocol goes final (and NEVER before)! */ //20160913, kason fix rsync vulnerability issues #Bug id:88143
 #define SUBPROTOCOL_VERSION 0
 
 /* We refuse to interoperate with versions that are not in this range.
@@ -615,6 +624,10 @@ struct ht_int64_node {
 #define ACLS_NEED_MASK 1
 #endif
 
+#ifdef RSYNC_PROGRESS
+#define	MIN_TICK_DIFF_UPDATE	5000
+#endif //RSYNC_PROGRESS
+
 union file_extras {
 	int32 num;
 	uint32 unum;
@@ -626,6 +639,11 @@ struct file_struct {
 	uint32 len32;		/* Lowest 32 bits of the file's length */
 	uint16 mode;		/* The item's type and permissions */
 	uint16 flags;		/* The FLAG_* bits for this item */
+
+#ifdef	RSYNC_PROGRESS
+	int64	nbSize;		///< size of this file in byte
+#endif	//RSYNC_PROGRESS
+
 	const char basename[1];	/* The basename (AKA filename) follows */
 };
 
@@ -817,6 +835,17 @@ struct filter_list_struct {
 	char *debug_type;
 };
 
+#ifdef RSYNC_PROGRESS
+// The statistic of a folder tree.
+typedef struct _T_TREE_STAT_
+{
+	uint64_t	cnFiles;		// The total number of files in this folder three.
+	uint64_t	cnFolders;		// The total number of sub-folders in this folder tree.
+	uint64_t	cbFiles;		// The total size of files in byte in this folder tree.
+	uint64_t	cnBlocks;		// The total blocks occupied by this tree.
+} T_TREE_STAT, *PT_TREE_STAT;
+#endif	//RSYNC_PROGRESS
+
 struct stats {
 	int64 total_size;
 	int64 total_transferred_size;
@@ -829,6 +858,17 @@ struct stats {
 	int64 flist_size;
 	int num_files;
 	int num_transferred_files;
+
+#ifdef RSYNC_PROGRESS
+	T_TREE_STAT		ttStat;		// The status of the tree to be synced.
+	unsigned long	nfDone;		///< total number of dirs/files were done
+	unsigned long	nfTotal;	///< total number of dirs/files to be sent
+	unsigned long long	nbSent;		///< total size of files were sent in byte
+	unsigned long long	nbSkip;		///< total size of files were skip in byte
+	unsigned long long	nbTotal;	///< total size of files to be processed in byte
+	unsigned long long	msSent;		///< total time of sending files in mini-second
+	unsigned long long	msBase;		///< the start time to send a file
+#endif	//RSYNC_PROGRESS
 };
 
 struct chmod_mode_struct;

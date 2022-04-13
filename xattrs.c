@@ -33,6 +33,10 @@ extern int read_only;
 extern int list_only;
 extern int preserve_xattrs;
 extern int checksum_seed;
+#ifdef QNAPNAS
+extern int g_bNoChecksum;
+extern int g_bXattr_richacl;
+#endif
 
 #define RSYNC_XAL_INITIAL 5
 #define RSYNC_XAL_LIST_INITIAL 100
@@ -214,8 +218,13 @@ static int rsync_xal_get(const char *fname, item_list *xalp)
 #ifdef HAVE_LINUX_XATTRS
 	int user_only = am_sender ? 0 : am_root <= 0;
 #endif
+	struct stat st;
+
 	rsync_xa *rxa;
 	int count;
+#ifdef QNAPNAS
+	int oldg_bNoChecksum;
+#endif
 
 	/* This puts the name list into the "namebuf" buffer. */
 	if ((list_len = get_xattr_names(fname)) < 0)
@@ -228,10 +237,32 @@ static int rsync_xal_get(const char *fname, item_list *xalp)
 #ifdef HAVE_LINUX_XATTRS
 		/* We always ignore the system namespace, and non-root
 		 * ignores everything but the user namespace. */
+#ifdef QNAPNAS
+                if (!g_bXattr_richacl || !HAS_PREFIX(name, "system.richacl")) {
+#endif
 		if (user_only ? !HAS_PREFIX(name, USER_PREFIX)
 			      : HAS_PREFIX(name, SYSTEM_PREFIX))
 			continue;
+#ifdef QNAPNAS
+                }
 #endif
+#endif
+		if (stat(fname, &st))
+			continue;
+
+		/* 20171221 bug 117335
+		 * In the user.* namespace, only regular files and directories can have
+		 * extended attributes.*/
+		if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode)) {
+			if (HAS_PREFIX(name, USER_PREFIX)) {
+				continue;
+			}
+		}
+
+		/* 20171221 bug 117335, skip sync "user.qtier" */
+		if (strcmp(name, "user.qtier") == 0) {
+			continue;
+		}
 
 		/* No rsync.%FOO attributes are copied w/o 2 -X options. */
 		if (name_len > RPRE_LEN && name[RPRE_LEN] == '%'
@@ -251,6 +282,11 @@ static int rsync_xal_get(const char *fname, item_list *xalp)
 		if (datum_len > MAX_FULL_DATUM) {
 			/* For large datums, we store a flag and a checksum. */
 			name_offset = 1 + MAX_DIGEST_LEN;
+#ifdef QNAPNAS
+			/* Bug 116364 */
+			oldg_bNoChecksum = g_bNoChecksum;
+			g_bNoChecksum = 0;
+#endif
 			sum_init(checksum_seed);
 			sum_update(ptr, datum_len);
 			free(ptr);
@@ -259,6 +295,9 @@ static int rsync_xal_get(const char *fname, item_list *xalp)
 				out_of_memory("rsync_xal_get");
 			*ptr = XSTATE_ABBREV;
 			sum_end(ptr + 1);
+#ifdef QNAPNAS
+			g_bNoChecksum = oldg_bNoChecksum;
+#endif
 		} else
 			name_offset = datum_len;
 
@@ -310,9 +349,15 @@ int copy_xattrs(const char *source, const char *dest)
 #ifdef HAVE_LINUX_XATTRS
 		/* We always ignore the system namespace, and non-root
 		 * ignores everything but the user namespace. */
+#ifdef QNAPNAS
+                if (!g_bXattr_richacl || !HAS_PREFIX(name, "system.richacl")) {
+#endif
 		if (user_only ? !HAS_PREFIX(name, USER_PREFIX)
 			      : HAS_PREFIX(name, SYSTEM_PREFIX))
 			continue;
+#ifdef QNAPNAS
+                }
+#endif
 #endif
 
 		datum_len = 0;
@@ -769,6 +814,9 @@ static int rsync_xal_set(const char *fname, item_list *xalp,
 #endif
 	size_t name_len;
 	int ret = 0;
+#ifdef QNAPNAS
+	int oldg_bNoChecksum;
+#endif
 
 	/* This puts the current name list into the "namebuf" buffer. */
 	if ((list_len = get_xattr_names(fname)) < 0)
@@ -794,9 +842,17 @@ static int rsync_xal_set(const char *fname, item_list *xalp,
 				goto still_abbrev;
 			}
 
+#ifdef QNAPNAS
+			/* Bug 116364 */
+			oldg_bNoChecksum = g_bNoChecksum;
+			g_bNoChecksum = 0;
+#endif
 			sum_init(checksum_seed);
 			sum_update(ptr, len);
 			sum_end(sum);
+#ifdef QNAPNAS
+			g_bNoChecksum = oldg_bNoChecksum;
+#endif
 			if (memcmp(sum, rxas[i].datum + 1, MAX_DIGEST_LEN) != 0) {
 				free(ptr);
 				goto still_abbrev;
@@ -842,9 +898,15 @@ static int rsync_xal_set(const char *fname, item_list *xalp,
 #ifdef HAVE_LINUX_XATTRS
 		/* We always ignore the system namespace, and non-root
 		 * ignores everything but the user namespace. */
+#ifdef QNAPNAS
+                if (!g_bXattr_richacl || !HAS_PREFIX(name, "system.richacl")) {
+#endif
 		if (user_only ? !HAS_PREFIX(name, USER_PREFIX)
 			      : HAS_PREFIX(name, SYSTEM_PREFIX))
 			continue;
+#ifdef QNAPNAS
+                }
+#endif
 #endif
 		if (am_root < 0 && name_len > RPRE_LEN
 		 && name[RPRE_LEN] == '%' && strcmp(name, XSTAT_ATTR) == 0)

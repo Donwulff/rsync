@@ -99,6 +99,27 @@ NORETURN void _exit_cleanup(int code, const char *file, int line)
 	static const char *exit_file = NULL;
 	static int unmodified_code = 0;
 
+#ifdef QTS_SNAPSHOT
+        extern struct pid_status *pid_stat_table;
+        extern int pid_stat_table_size;
+
+        if (pid_stat_table) {
+                free(pid_stat_table);
+                pid_stat_table_size = 0;
+                pid_stat_table = NULL;
+        }
+#endif
+
+#ifdef	RSYNC_PROGRESS
+	extern char  *pszSchedule;
+	if (pszSchedule && (RERR_SIGNAL != code))
+	{
+		extern int  g_bAbort;
+		g_bAbort = 2;
+		msleep(50);
+	}
+#endif	//RSYNC_PROGRESS
+
 	SIGACTION(SIGUSR1, SIG_IGN);
 	SIGACTION(SIGUSR2, SIG_IGN);
 

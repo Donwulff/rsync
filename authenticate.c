@@ -21,6 +21,26 @@
 #include "rsync.h"
 
 extern char *password_file;
+#ifdef QNAPNAS
+#include "Util.h"
+
+#define	SZK_RSYNCD_AUTH			"Rsync Model"
+#define	SZK_RSYNCD_USER			"rsync user"
+#define	SZK_RSYNCD_PSWD			"rsync pswd"
+#define	SZK_RSYNCD_ENPSWD		"rsync enpswd"
+#define	SZV_RSYNCD_AUTH			"NORMAL"			// "QNAP", "NORMAL"
+#define	SZV_RSYNCD_USER_DEF		"rsync"
+#define	SZV_RSYNCD_PSWD_DEF		"rsync"
+#define	SZP_RSYNCD_CONF			"/etc/config/rsyncd.conf"
+#define	SZP_ULINUX_CONF			"/etc/config/uLinux.conf"
+#define	SZP_RSYNC_SCHEDULE_CONF	"/etc/config/rsync_schedule.conf"
+
+extern char *password;	//Richard 20070605 add
+extern int sever_mode;//Richard 20080111 add
+extern char *pszSchedule;	// current schedule name
+extern int iForceRsyncUser;
+extern char *config_file;
+#endif
 
 /***************************************************************************
 encode a buffer using base64 - simple and slow algorithm. null terminates
@@ -229,11 +249,20 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
 	char secret[512];
 	char pass2[MAX_DIGEST_LEN*2];
 	char *tok, *pass;
-
+#ifdef QNAPNAS
+	//Richard 20070921 add check user for share
+	char *name = lp_name(module);
+	int g_access=SHARE_NOACCESS;
+#endif
+#ifdef QNAPNAS
+	if(sever_mode == 0){
+#endif
 	/* if no auth list then allow anyone in! */
 	if (!users || !*users)
 		return "";
-
+#ifdef QNAPNAS
+	}
+#endif
 	gen_challenge(addr, challenge);
 
 	io_printf(f_out, "%s%s\n", leader, challenge);
@@ -247,6 +276,89 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
 	}
 	*pass++ = '\0';
 
+#ifdef QNAPNAS
+	if(sever_mode == 1){
+		char	szAuth[64]="", szUser[64]="", szPswd[128]="";
+		
+		char	regPw[512]={0},
+				regEnPw[512]={0},
+				cmd[576] ={0}; // 512+64
+		
+		FILE	*fp_encode= NULL,
+				*fp_decode= NULL;
+
+
+		// Check if the rsyncd is accepting the connections from the orginal rsync clients.
+		if ((SUCCESS == Conf_Get_Field(SZP_ULINUX_CONF, "System", SZK_RSYNCD_AUTH, szAuth, sizeof(szAuth))) && !strcmp(SZV_RSYNCD_AUTH, szAuth) || iForceRsyncUser )
+		{
+			char conf_path[128] = {0};
+			if(config_file){
+			    strncpy(conf_path, config_file, sizeof(conf_path));
+			}
+			else{
+			    strncpy(conf_path, SZP_RSYNCD_CONF, sizeof(conf_path));
+			}
+			if (SUCCESS != Conf_Get_Field(conf_path, "", SZK_RSYNCD_USER, szUser, sizeof(szUser)))  strcpy(szUser, SZV_RSYNCD_USER_DEF);
+			// Samson 20140828 add encode/decode mechanism for password
+			if (SUCCESS != Conf_Get_Field(conf_path, "", SZK_RSYNCD_ENPSWD, regEnPw, sizeof(regEnPw))){ // "rsync enpswd" doesn't exist
+				if (SUCCESS != Conf_Get_Field(conf_path, "", SZK_RSYNCD_PSWD, regPw, sizeof(regPw))){ // "rsync pswd" doesn't exist
+					strncpy(szPswd, SZV_RSYNCD_PSWD_DEF, sizeof(szPswd));
+				}else{ // "rsync pswd" exists
+					// Encode then write "rsync enpswd" to config and remove "rsync pswd"
+					sprintf(cmd, "/sbin/get_encstr %s e 2>/dev/null", regPw);
+					if (NULL != (fp_encode = popen(cmd, "r"))){
+						fgets(regEnPw, sizeof(regEnPw), fp_encode);
+						pclose(fp_encode);
+					}
+					regEnPw[strlen(regEnPw)] = '\0'; // result no new line
+					Conf_Set_Field(conf_path, "", SZK_RSYNCD_ENPSWD, regEnPw);
+					Conf_Remove_Field(conf_path, "", SZK_RSYNCD_PSWD); // not really remove, just set null string
+					// Decode to use
+					memset(cmd, 0, sizeof(cmd));
+					sprintf(cmd, "/sbin/get_encstr %s d 2>/dev/null", regEnPw);
+					if (NULL != (fp_decode = popen(cmd, "r"))){
+						fgets(szPswd, sizeof(szPswd), fp_decode);
+						pclose(fp_decode);
+					}
+					szPswd[strlen(szPswd)] = '\0'; // result no new line
+				}
+			}else{ // "rsync enpswd" exists, Decode to use
+				sprintf(cmd, "/sbin/get_encstr %s d 2>/dev/null", regEnPw);
+				if (NULL != (fp_decode = popen(cmd, "r"))){
+					fgets(szPswd, sizeof(szPswd), fp_decode);
+					pclose(fp_decode);
+				}
+				szPswd[strlen(szPswd)] = '\0'; // result no new line
+			}
+			memset(pass2, 0, sizeof(pass2));
+			memset(secret, 0, sizeof(secret));
+			strcpy(secret, szPswd);
+			generate_hash(secret, challenge, pass2);
+			if (!strcmp(szUser, line) && !strcmp(pass2, pass))
+			{
+				//printf("The user:password pairs are matched!\n");
+				goto pass_rsync_auth;
+			}
+		}
+		
+		// Take the first 16 characters.
+//		if (16 < strlen(pass))  pass[16] = 0;
+
+		//Richard 20070605 add check user for system
+		if(Check_System_User_Password(line, pass) != 0){
+			return NULL;
+		}
+		// Albert 20090924: Don't check security for share if the path is "".
+		if (*name)
+		{
+			//Richard 20070921 add check user for share
+			g_access = Get_NAS_User_Security_For_Share(line, name);
+			if (g_access!=SHARE_READWRITE){
+				return NULL;
+			}
+		}
+	}else{
+#endif
 	if (!(users = strdup(users)))
 		out_of_memory("auth_server");
 
@@ -281,9 +393,37 @@ char *auth_server(int f_in, int f_out, int module, const char *host,
 			lp_name(module), host, addr);
 		return NULL;
 	}
-
+#ifdef QNAPNAS
+	}
+pass_rsync_auth:
+#endif
 	return strdup(line);
 }
+
+#ifdef QNAPNAS
+static int rsync_passwd_transfer(char *in_str, char *out_str, int buf_size)
+{
+	int i = 0, j = 0;
+
+	for (i=0; in_str[i]!='\0'; i++) {
+		if ((in_str[i] == '`') || (in_str[i] == '$') || (in_str[i] == '"') || (in_str[i] == '\\')) {
+			if ( (j+1) < buf_size) {
+				out_str[j] = '\\';
+				out_str[j+1] = in_str[i];
+				j = j+2;
+			}
+			else
+				break;
+		}
+		else {
+			out_str[j] = in_str[i];
+			j++;
+		}
+	}
+	out_str[j]=0;
+	return 0;
+}
+#endif
 
 void auth_client(int fd, const char *user, const char *challenge)
 {
@@ -292,7 +432,74 @@ void auth_client(int fd, const char *user, const char *challenge)
 
 	if (!user || !*user)
 		user = "nobody";
+#ifdef QNAPNAS
+	char szPswd[128]= "";
+	char changePswd[128]= "";
 
+	char	regPw[512]={0},
+			regEnPw[512]={0},
+			cmd[576] ={0}; // 512+64
+	
+	FILE	*fp_encode= NULL,
+			*fp_decode= NULL;
+	
+	if(sever_mode == 1){
+		//Richard 20120914 add get password form file
+		if(pszSchedule){
+			// Samson 20140828 add encode/decode mechanism for password
+			if (SUCCESS != Conf_Get_Field(SZP_RSYNC_SCHEDULE_CONF, pszSchedule, "EnPassword", regEnPw, sizeof(regEnPw))) { // "EnPassword" doesn't exist
+				if (SUCCESS != Conf_Get_Field(SZP_RSYNC_SCHEDULE_CONF, pszSchedule, "Password", regPw, sizeof(regPw))) { // "Password" doesn't exist
+					rsync_passwd_transfer(password, changePswd, sizeof(changePswd));
+				}else{ //"Password" exists
+					// Encode then write "EnPassword" to config and remove "Password"
+					sprintf(cmd, "/sbin/get_encstr %s e 2>/dev/null", regPw);
+					if (NULL != (fp_encode = popen(cmd, "r"))){
+						fgets(regEnPw, sizeof(regEnPw), fp_encode);
+						pclose(fp_encode);
+					}
+					regEnPw[strlen(regEnPw)] = '\0'; // result no new line
+					Conf_Set_Field(SZP_RSYNC_SCHEDULE_CONF, pszSchedule, "EnPassword", regEnPw);
+					Conf_Remove_Field(SZP_RSYNC_SCHEDULE_CONF, pszSchedule, "Password"); // not really remove, just set null string
+					// Decode to use
+					memset(cmd, 0, sizeof(cmd));
+					sprintf(cmd, "/sbin/get_encstr %s d 2>/dev/null", regEnPw);
+					if (NULL != (fp_decode = popen(cmd, "r"))){
+						fgets(szPswd, sizeof(szPswd), fp_decode);
+						pclose(fp_decode);
+					}
+					szPswd[strlen(szPswd)] = '\0'; // result no new line
+					rsync_passwd_transfer(szPswd, changePswd, sizeof(changePswd));
+				}
+			}
+			else{ // "EnPassword" exists
+				sprintf(cmd, "/sbin/get_encstr %s d 2>/dev/null", regEnPw);
+				if (NULL != (fp_decode = popen(cmd, "r"))){
+					int i=0;
+					do {
+						fgets(szPswd, sizeof(szPswd), fp_decode);
+						if (i++ > 20) {
+							rprintf(FLOG, "@@ %s:L%d fgets szPswd NULL over [%d]th\n",  __FUNCTION__, __LINE__, i);
+							break;
+						}
+					} while (!feof(fp_decode));
+					pclose(fp_decode);
+				}
+				szPswd[strlen(szPswd)] = '\0'; // result no new line
+				rsync_passwd_transfer(szPswd, changePswd, sizeof(changePswd));
+			}
+		}
+		else{
+			//Richard 20070605 add for rysnc can send password for system user
+			//pass = password;
+			rsync_passwd_transfer(password, changePswd, sizeof(changePswd));
+		}
+		pass = changePswd;
+		if (!pass)
+			pass = "";
+
+		io_printf(fd, "%s %s\n", user, pass);
+	}else{
+#else
 	if (!(pass = getpassf(password_file))
 	 && !(pass = getenv("RSYNC_PASSWORD"))) {
 		/* XXX: cyeoh says that getpass is deprecated, because
@@ -306,10 +513,62 @@ void auth_client(int fd, const char *user, const char *challenge)
                  */
 		pass = getpass("Password: ");
 	}
-
+#endif
+#ifdef QNAPNAS
+	//Richard 20120914 add get password form file
+	if(pszSchedule){
+		// Samson 20140828 add encode/decode mechanism for password
+		if (SUCCESS != Conf_Get_Field(SZP_RSYNC_SCHEDULE_CONF, pszSchedule, "EnPassword", regEnPw, sizeof(regEnPw))){ // "EnPassword" doesn't exist
+			if (SUCCESS != Conf_Get_Field(SZP_RSYNC_SCHEDULE_CONF, pszSchedule, "Password", regPw, sizeof(regPw))){ // "Password" doesn't exist
+				pass = password;
+			}else{ // "Password" exists
+				// Encode then write "EnPassword" to config and remove "Password"
+				sprintf(cmd, "/sbin/get_encstr %s e 2>/dev/null", regPw);
+				if (NULL != (fp_encode = popen(cmd, "r"))){
+					fgets(regEnPw, sizeof(regEnPw), fp_encode);
+					pclose(fp_encode);
+				}
+				regEnPw[strlen(regEnPw)] = '\0'; // result no new line
+				Conf_Set_Field(SZP_RSYNC_SCHEDULE_CONF, pszSchedule, "EnPassword", regEnPw);
+				Conf_Remove_Field(SZP_RSYNC_SCHEDULE_CONF, pszSchedule, "Password"); // not really remove, just set null string
+				// Decode to use
+				memset(cmd, 0, sizeof(cmd));
+				sprintf(cmd, "/sbin/get_encstr %s d 2>/dev/null", regEnPw);
+				if (NULL != (fp_decode = popen(cmd, "r"))){
+					fgets(szPswd, sizeof(szPswd), fp_decode);
+					pclose(fp_decode);
+				}
+				szPswd[strlen(szPswd)] = '\0'; // result no new line
+				pass = szPswd;
+			}
+		}
+		else{ // "EnPassword" exists
+			sprintf(cmd, "/sbin/get_encstr %s d 2>/dev/null", regEnPw);
+			if (NULL != (fp_decode = popen(cmd, "r"))){
+				int i=0;
+				do {
+					fgets(szPswd, sizeof(szPswd), fp_decode);
+					if (i++ > 20) {
+						rprintf(FLOG, "@@ %s:L%d fgets szPswd NULL over [%d]th\n",  __FUNCTION__, __LINE__, i);
+						break;
+					}
+				} while (!feof(fp_decode));
+				pclose(fp_decode);
+			}
+			szPswd[strlen(szPswd)] = '\0'; // result no new line
+			pass = szPswd;
+		}
+	}
+	else{
+		pass = password;
+	}
+#endif
 	if (!pass)
 		pass = "";
 
 	generate_hash(pass, challenge, pass2);
 	io_printf(fd, "%s %s\n", user, pass2);
+#ifdef QNAPNAS
+	}
+#endif
 }

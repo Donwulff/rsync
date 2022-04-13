@@ -29,6 +29,11 @@
 #include <netinet/in_systm.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
+#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+#include <pthread.h>
+#include <sys/inotify.h>
+#include <sys/shm.h>
+#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 
 extern char *bind_address;
 extern char *sockopts;
@@ -38,6 +43,26 @@ extern int connect_timeout;
 #ifdef HAVE_SIGACTION
 static struct sigaction sigact;
 #endif
+// Modified by Jeff Chang 2011/5/4, for service binding
+#ifdef QNAPNAS
+extern int  g_bHup;
+
+//////////////////////////////////////////////////////////////////////////////
+// Network interface related definitaions / functions.
+
+#define	MAX_BINDING_ADDRESS		8			// Maximum binding address.
+#define	SZP_GET_BIND_ADDR		"/sbin/getbindaddr"
+#define SZ_INADDR_ANY           "0.0.0.0"
+// The structure for binding address information.
+typedef	struct _T_BIND_ADDR_
+{
+	int		bEnabled;
+	int		cnIpv4;
+	int		cnIpv6;
+	char    **ryszIpv4;
+	char    **ryszIpv6;
+} T_BIND_ADDR, *PT_BIND_ADDR;
+#endif //QNAPNAS
 
 /**
  * Establish a proxy connection on an open socket to a web proxy by
@@ -524,12 +549,395 @@ static RETSIGTYPE sigchld_handler(UNUSED(int val))
 	signal(SIGCHLD, sigchld_handler);
 #endif
 }
+// Modified by Jeff Chang 2011/5/4, for service binding
+#ifdef QNAPNAS
+static void Release_Bind_Addr(PT_BIND_ADDR ptbaAddr)
+{
+	if (!ptbaAddr) return;
 
+	if (ptbaAddr->ryszIpv4)
+	{
+		int idx;
+		for(idx=0; idx<ptbaAddr->cnIpv4; idx++)
+			free(ptbaAddr->ryszIpv4[idx]);
+		free(ptbaAddr->ryszIpv4);
+		ptbaAddr->ryszIpv4 = NULL;
+	}
+	if (ptbaAddr->ryszIpv6)
+	{
+		int idx;
+		for(idx=0; idx<ptbaAddr->cnIpv6; idx++)
+			free(ptbaAddr->ryszIpv6[idx]);
+		free(ptbaAddr->ryszIpv6);
+		ptbaAddr->ryszIpv6 = NULL;
+	}
+}
+
+/**
+ * \brief	Get the service binding address.
+ * \param	ptBindAddr	The buffer to the service binding settings.
+ * \return	0 if function success, or -XXX if error.
+ */
+static int Get_Binding_Address(PT_BIND_ADDR ptBindAddr)
+{
+	int  iRet=-ENOMEM, cbAddr;
+	char  szLine[256];
+	FILE  *pfAddr = NULL;
+	struct stat  tStat;
+
+	// Reset the inet address first.
+	ptBindAddr->bEnabled = False;
+	ptBindAddr->cnIpv4 = ptBindAddr->cnIpv6 = 0;
+
+	Release_Bind_Addr(ptBindAddr);
+	// Just report no binding address if the getbindaddr is not existed.
+	if (-1 == stat(SZP_GET_BIND_ADDR, &tStat))  return 0;
+	if (NULL == (pfAddr = popen(SZP_GET_BIND_ADDR " RSYNC 2>/dev/null", "r")))  return 0;
+	while (NULL != fgets(szLine, sizeof(szLine), pfAddr))
+	{
+		szLine[sizeof(szLine)-1] = '\0';
+		if (0 >= (cbAddr = strlen(szLine)))  continue;
+		if ('\n' == szLine[cbAddr-1])  szLine[cbAddr-1] = '\0';
+		if (NULL != strchr(szLine, ':'))
+		{
+			if(NULL == (ptBindAddr->ryszIpv6 = (char**)realloc(ptBindAddr->ryszIpv6, (++ptBindAddr->cnIpv6)*sizeof(char*))))
+			{
+				ptBindAddr->cnIpv6 = 0;
+				goto _exit;
+			}
+			if(NULL == (ptBindAddr->ryszIpv6[ptBindAddr->cnIpv6-1] = (char*)malloc(INET6_ADDRSTRLEN)))
+			{
+				ptBindAddr->cnIpv6 = 0;
+				goto _exit;
+			}
+			strcpy(ptBindAddr->ryszIpv6[ptBindAddr->cnIpv6-1], szLine);
+		}
+		else if (NULL != strchr(szLine, '.'))
+		{
+			if (strstr(SZ_INADDR_ANY, szLine))
+			{
+				ptBindAddr->bEnabled = False;
+				ptBindAddr->cnIpv4 = ptBindAddr->cnIpv6 = 0;
+				break;
+			}
+			if(NULL == (ptBindAddr->ryszIpv4 = (char**)realloc(ptBindAddr->ryszIpv4, (++ptBindAddr->cnIpv4)*sizeof(char*)*INET6_ADDRSTRLEN)))
+			{
+				ptBindAddr->cnIpv4 = 0;
+				goto _exit;
+			}
+			if(NULL == (ptBindAddr->ryszIpv4[ptBindAddr->cnIpv4-1] = (char*)malloc(INET_ADDRSTRLEN)))
+			{
+				ptBindAddr->cnIpv4 = 0;
+				goto _exit;
+			}
+			strcpy(ptBindAddr->ryszIpv4[ptBindAddr->cnIpv4-1], szLine);
+		}
+	}
+
+	iRet = 0;
+_exit:
+	if(iRet != 0)
+		Release_Bind_Addr(ptBindAddr);
+	pclose(pfAddr);
+	ptBindAddr->bEnabled = ptBindAddr->cnIpv4 || ptBindAddr->cnIpv6;
+	return 0;
+}
+
+/**
+ * \brief	Check if a socket should be accepted by the service binding address or not.
+ * \param	fdAccept	The socket FD.
+ * \param	ptBindAddr	The buffer to the service binding settings.
+ * \param	pszAddrBuf	The buffer to get the incoming address.
+ * \return	0 if function success, or -XXX if error.
+ */
+static int Check_Binding_Address(int fdAccept, PT_BIND_ADDR ptBindAddr, char *pszAddrBuf)
+{
+	int  idx, iRet = 0;
+	socklen_t  cbSktAddr;
+	char  *pszAddr=pszAddrBuf;
+	struct sockaddr_storage  tsaLocal;
+	
+	if (ptBindAddr->bEnabled)
+	{
+		cbSktAddr = sizeof(tsaLocal);
+		if (-1 == getsockname(fdAccept, (struct sockaddr *)&tsaLocal, &cbSktAddr))
+		{
+			goto exit_check_bind_addr;
+		}
+		if ((AF_INET == tsaLocal.ss_family) && (0 < ptBindAddr->cnIpv4))
+		{
+			struct sockaddr_in *psiLocal = (struct sockaddr_in *)&tsaLocal;
+			strcpy(pszAddr, inet_ntoa(psiLocal->sin_addr));
+			for (idx=0; (idx<ptBindAddr->cnIpv4) && strcmp(pszAddr, ptBindAddr->ryszIpv4[idx]); idx++);
+			iRet = (idx >= ptBindAddr->cnIpv4) ? -ENOTTY : 0;
+		}
+		else if ((AF_INET6 == tsaLocal.ss_family) && (0 < ptBindAddr->cnIpv6))
+		{
+			struct sockaddr_in6 *psiLocal = (struct sockaddr_in6 *)&tsaLocal;
+			inet_ntop(tsaLocal.ss_family, &psiLocal->sin6_addr, pszAddr, INET6_ADDRSTRLEN);
+			// Make sure the IP is real IPv6 or IPv4 expressed in IPv6
+			if (!memcmp("::ffff:", pszAddr, 7))
+			{
+				pszAddr += 7;
+				for (idx=0; (idx<ptBindAddr->cnIpv4) && strcmp(pszAddr, ptBindAddr->ryszIpv4[idx]); idx++);
+				iRet = (idx >= ptBindAddr->cnIpv4) ? -ENOTTY : 0;
+			}
+			else
+			{
+				for (idx=0; (idx<ptBindAddr->cnIpv6) && strcmp(pszAddr, ptBindAddr->ryszIpv6[idx]); idx++);
+				iRet = (idx >= ptBindAddr->cnIpv6) ? -ENOTTY : 0;
+			}
+		}
+		else
+		{
+			iRet = -ENOTTY;
+		}
+	}
+exit_check_bind_addr:
+	return iRet;
+}
+
+#ifdef SUPPORT_LIMITRATE
+int g_bDRate = FALSE;					//<<< The flag of stop monitering band width.
+
+/**
+ * \brief	Check whether if there data is available on a file descriptor or not.
+ * \param	fdSocket	The file descriptor to read.
+ * \param	msWait		The mini-second of timeout to check the file descriptor.
+ * \return	> 0 if data is available, 0 if timeout, or -XXX if error.
+ */
+int Is_FD_Ready_To_Read(int fdSocket, int msWait)
+{
+    int iRet;
+	fd_set  tfsRead;
+    struct timeval  ttvWait;
+
+	// Watch fdRead to see when it has input.
+	FD_ZERO(&tfsRead);
+	FD_SET(fdSocket, &tfsRead);
+
+	// Wait up to msWait mini-seconds.
+	ttvWait.tv_sec = msWait / 1000;
+	ttvWait.tv_usec = (msWait % 1000 * 1000);
+
+	iRet = select(fdSocket+1, &tfsRead, NULL, NULL, &ttvWait);
+	if (iRet == -1)  return -errno;
+	return  iRet;
+}
+
+/**
+ * \brief	Update the band width value from config file
+ * \param	pVoid	The buffer of daemon info.
+ */
+void* Update_LimitRate_Thread(void *pVoid)
+{
+	#define MSEC_PER_SECOND 1000
+	#define CBMAX_CONF_PATH 128
+	int iRet, mfMask=IN_ONESHOT|IN_MOVE|IN_DELETE|IN_MODIFY, fdiNotify=-1, idNotify=-1, bDirty=FALSE, idx=0, cnAvailServer=0, cnAvailUpServer=0, cnAvailDwServer=0, idShm=0;
+	int32_t cbSLimitRate=0, cbRLimitRate=0;
+	PT_LIMITRATE piShm=NULL;
+	//int* pidChild = (int*)pVoid;
+	char  szBufVnt[sizeof(struct inotify_event)+CBMAX_CONF_PATH], szSLimitRate[11], szRLimitRate[11];
+	struct inotify_event  *ptinEvent=(struct inotify_event*)&szBufVnt;
+	struct stat  tStat;
+	time_t itModify=0;
+
+	// Allocate & attach the share memory for limit rate.
+	if (-1 == (idShm = shmget(IKEY_SHM_LIMITRATE_SERVER, NB_SHM_LIMITRATE_SERVER, IPC_CREAT | SHM_R | SHM_W)))
+	{
+		iRet = -errno;
+		rsyserr(FERROR, errno, "Can't get a %d bytes share memory! (%d)", NB_SHM_LIMITRATE_SERVER, iRet);
+		goto exit_thread;
+	}
+	if (NULL == (piShm = (PT_LIMITRATE)shmat(idShm, NULL, 0)))
+	{
+		iRet = -errno;
+		rsyserr(FERROR, errno, "Can't attach a %d bytes share memory! (%d)", NB_SHM_LIMITRATE_SERVER, iRet);
+		goto exit_thread;
+	}
+	memset(piShm, -1, NB_SHM_LIMITRATE_SERVER);
+	
+	// Initial the inotify first.
+	if (-1 == (fdiNotify = inotify_init()))
+	{
+		iRet = -errno;
+		rsyserr(FERROR, errno, "Can't init inotify device file! (%d)", iRet);
+		goto exit_thread;
+	}
+	// Add inotify watch to this conf file.
+	if (-1 == (idNotify = inotify_add_watch(fdiNotify, SZP_RSYNCD_CONF, mfMask)))
+	{
+		iRet = -errno;
+		rsyserr(FERROR, errno, "Can't add an inotify watch of \"%s\" error! (%d)", SZP_RSYNCD_CONF, iRet);
+		goto exit_thread;
+	}
+
+	// The main loop of QSync monitor.
+	while (!g_bAbort && !g_bDRate)
+	{
+		// Check if there is an inotify event!
+		if (0 < (iRet = Is_FD_Ready_To_Read(fdiNotify, MSEC_PER_SECOND)))
+		{
+			memset(szBufVnt, 0, sizeof(szBufVnt));
+			if (-1 == read(fdiNotify, ptinEvent, sizeof(szBufVnt)))
+			{
+				iRet = -errno;
+				rsyserr(FERROR, errno, "Can't read the inotify event error! (%d)\n", iRet);
+				break;
+			}
+			//DEBUG_PRINTF("inotify - wd: %d, mask: 0x%X, cookie: 0x%X, len: %d, name: %s\n", ptinEvent->wd, ptinEvent->mask, ptinEvent->cookie, ptinEvent->len, ptinEvent->name);
+
+			// Check if conf file is modified.
+			if (ptinEvent->wd == idNotify)
+			{
+				bDirty = TRUE;
+				if (IN_IGNORED & ptinEvent->mask)  idNotify = -1;
+				//DEBUG_PRINTF("%s is modified!\n", ptsfConf->szpConf);
+			}
+			continue;
+		}
+		// Catched a signal?
+		else if (-EINTR == iRet)
+		{
+			// Don't exit if the signal is not an INT event.
+			if (-EINTR != g_bAbort)
+			{
+				iRet = 0;
+				continue;
+			}
+			//DEBUG_PRINTF("Catch a INT signal!\n");
+			break;
+		}
+		// Encounter error!
+		else if (0 > iRet)
+		{
+			if(-EINTR == iRet)
+			rsyserr(FERROR, iRet, "Check inotify device error! (%d)\n", iRet);
+			break;
+		}
+		// No inotify event is found till timeout.
+		else
+		{
+			stat(SZP_RSYNCD_CONF, &tStat);
+			// In case the inotify mechanism failed, we also check the modified time of the conf file.
+			if (!bDirty)
+			{
+				// Check if the modified time of the conf file was changed or not.
+				if (tStat.st_mtime != itModify)
+				{
+					if ((-1 != idNotify) && (-1 == inotify_rm_watch(fdiNotify, idNotify)))
+					{
+						//rsyserr(FERROR, iRet, "Can't remove the inotify watch of \"%s\", but all function will work normally. (%d)\n", SZP_RSYNCD_CONF, idNotify, -errno);
+					}
+					idNotify = -1;
+					bDirty = TRUE;
+				}
+			}
+			itModify = tStat.st_mtime;
+		}
+		if(TRUE == bDirty)
+		{
+			// Read the conf file.
+			if (0 != Conf_Get_Field(SZP_RSYNCD_CONF, "", SZK_RSYNCD_SLIMITRATE, szSLimitRate, sizeof(szSLimitRate)))  strcpy(szSLimitRate, SZV_RSYNCD_SLIMITRATE_DEF);
+			if (0 != Conf_Get_Field(SZP_RSYNCD_CONF, "", SZK_RSYNCD_RLIMITRATE, szRLimitRate, sizeof(szRLimitRate)))  strcpy(szRLimitRate, SZV_RSYNCD_RLIMITRATE_DEF);
+
+			// Add inotify watch to this conf file.
+			if (-1 == (idNotify = inotify_add_watch(fdiNotify, SZP_RSYNCD_CONF, mfMask)))
+			{
+				iRet = -errno;
+				rsyserr(FERROR, iRet, "Can't add an inotify watch of \"%s\" error! (%d)\n", SZP_RSYNCD_CONF, iRet);
+				goto exit_thread;
+			}
+			bDirty = FALSE;
+		}
+		
+		cnAvailServer = 0;
+		cnAvailUpServer = 0;
+		cnAvailDwServer = 0;
+		cbSLimitRate = 0;
+		cbRLimitRate = 0;
+		// seperate the calculating of band width of upload and download.
+		for (idx=0; idx<CN_BWLIMIT_SLOT; idx++)
+		{
+			if(-1 != piShm[idx].idPID)
+			{
+				// check the existence of the process
+				if(0 == (iRet = kill(piShm[idx].idPID, 0)))
+				{
+					// read the data transfer mode written by child process.
+					if(piShm[idx].bSender)
+						cnAvailUpServer++;
+					else
+						cnAvailDwServer++;
+					cnAvailServer++;
+				}
+				else if(ESRCH == errno)
+				{
+					// some child process exit!
+					piShm[idx].idPID = -1;
+				}
+			}
+		}
+		if(cnAvailUpServer)
+		{
+			cbSLimitRate = atoi(szSLimitRate)/cnAvailUpServer;
+			if((cbSLimitRate > 0) && (cbSLimitRate < CB_MIN_LIMITRATE) && (atoi(szSLimitRate) > 0))
+				cbSLimitRate = CB_MIN_LIMITRATE;
+		}
+		if(cnAvailDwServer)
+		{
+			cbRLimitRate = atoi(szRLimitRate)/cnAvailDwServer;
+			if((cbRLimitRate > 0) && (cbRLimitRate < CB_MIN_LIMITRATE) && (atoi(szRLimitRate) > 0))
+				cbRLimitRate = CB_MIN_LIMITRATE;
+		}
+
+		for (idx=0; idx<CN_BWLIMIT_SLOT; idx++)
+		{
+			if(-1 != piShm[idx].idPID)
+			{
+				piShm[idx].cbSBwlimit = cbSLimitRate;
+				piShm[idx].cbRBwlimit = cbRLimitRate;
+			}
+		}
+	}
+exit_thread:
+	if(fdiNotify != -1)
+	{
+		if(idNotify != -1)
+			inotify_rm_watch(fdiNotify, idNotify);
+		close(fdiNotify);
+	}
+	if (NULL != piShm)  shmdt(piShm);
+	pthread_exit(NULL);
+}
+
+#endif /* SUPPORT_LIMITRATE */
+#endif //QNAPNAS
 
 void start_accept_loop(int port, int (*fn)(int, int))
 {
 	fd_set deffds;
 	int *sp, maxfd, i;
+// Modified by Jeff Chang 2011/5/4, for service binding
+#ifdef QNAPNAS
+	char  szIpAddr[INET6_ADDRSTRLEN];
+	T_BIND_ADDR tbaDaemon;
+	// jeff modify 2011.8.26, for limit band width.
+	#ifdef SUPPORT_LIMITRATE
+	pthread_t thLimitRateID=-1;
+	if(g_bQnapBwlimit)
+	{
+		// Launch an additional thread to handle the band width related variables to the share memory.
+		if (0 != pthread_create(&thLimitRateID, NULL, Update_LimitRate_Thread, NULL))
+		{
+			rsyserr(FERROR, errno, "Can't create a thread to moniter limit rate!");
+		}
+	}
+	#endif /* SUPPORT_LIMITRATE */
+	memset(&tbaDaemon, 0, sizeof(tbaDaemon));
+	Get_Binding_Address(&tbaDaemon);
+
+#endif //QNAPNAS
 
 #ifdef HAVE_SIGACTION
 	sigact.sa_flags = SA_NOCLDSTOP;
@@ -591,6 +999,20 @@ void start_accept_loop(int port, int (*fn)(int, int))
 
 		if (fd < 0)
 			continue;
+// Modified by Jeff Chang 2011/5/4, for service binding
+#ifdef QNAPNAS
+		if(g_bHup)
+		{
+			Get_Binding_Address(&tbaDaemon);
+			g_bHup = False;
+		}
+		// Check if the incomming interface matched the service binding settings.
+		if (0 != Check_Binding_Address(fd, &tbaDaemon, szIpAddr))
+		{
+			close(fd);
+			continue;
+		}
+#endif //QNAPNAS
 
 		SIGACTION(SIGCHLD, sigchld_handler);
 
@@ -617,6 +1039,12 @@ void start_accept_loop(int port, int (*fn)(int, int))
 			close(fd);
 		}
 	}
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+	// terminate thread of limit rate
+	g_bDRate = TRUE;
+	if(-1 != (int)thLimitRateID)
+		pthread_join(thLimitRateID, NULL);
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 }
 
 

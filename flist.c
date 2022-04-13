@@ -70,8 +70,12 @@ extern int use_safe_inc_flist;
 extern int need_unsorted_flist;
 extern int sender_symlink_iconv;
 extern int unsort_ndx;
+extern uid_t our_uid; //rsync vulnerability issues #Bug id:88143
 extern struct stats stats;
 extern char *filesfrom_host;
+#ifdef QNAPNAS
+extern int g_bNoChecksum;
+#endif
 
 extern char curr_dir[MAXPATHLEN];
 
@@ -135,6 +139,11 @@ void init_flist(void)
 		rprintf(FINFO, "FILE_STRUCT_LEN=%d, EXTRA_LEN=%d\n",
 			(int)FILE_STRUCT_LEN, (int)EXTRA_LEN);
 	}
+#ifdef QNAPNAS
+	if (g_bNoChecksum)
+		checksum_len = 1;
+	else
+#endif
 	checksum_len = protocol_version < 21 ? 2
 		     : protocol_version < 30 ? MD4_DIGEST_LEN
 		     : MD5_DIGEST_LEN;
@@ -1089,6 +1098,10 @@ struct file_struct *make_file(const char *fname, struct file_list *flist,
 	STRUCT_STAT st;
 	char *bp;
 
+#ifdef	RSYNC_PROGRESS
+	extern char  *pszSchedule;
+#endif	//RSYNC_PROGRESS
+
 	if (strlcpy(thisname, fname, sizeof thisname) >= sizeof thisname) {
 		io_error |= IOERR_GENERAL;
 		rprintf(FERROR_XFER, "skipping overly long name: %s\n", fname);
@@ -1277,6 +1290,21 @@ struct file_struct *make_file(const char *fname, struct file_list *flist,
 	file->flags = flags;
 	file->modtime = st.st_mtime;
 	file->len32 = (uint32)st.st_size;
+
+#ifdef	RSYNC_PROGRESS
+	// save the file size (nbSize) and accumulating the total file size (nbTotal)
+	if (pszSchedule)
+	{
+		file->nbSize = 0;
+		stats.nfTotal ++;
+		if (!S_ISDIR(st.st_mode))
+		{
+			file->nbSize = st.st_size;
+			stats.nbTotal += file->nbSize;
+		}
+	}
+#endif	//RSYNC_PROGRESS
+	
 #if SIZEOF_CAPITAL_OFF_T >= 8
 	if (st.st_size > 0xFFFFFFFFu && S_ISREG(st.st_mode)) {
 		file->flags |= FLAG_LENGTH64;
@@ -1284,11 +1312,14 @@ struct file_struct *make_file(const char *fname, struct file_list *flist,
 	}
 #endif
 	file->mode = st.st_mode;
-	if (uid_ndx) /* Check uid_ndx instead of preserve_uid for del support */
+	//if (uid_ndx) /* Check uid_ndx instead of preserve_uid for del support */  //rsync vulnerability issues #Bug id:88143
+	if (preserve_uid) //rsync vulnerability issues #Bug id:88143
 		F_OWNER(file) = st.st_uid;
-	if (gid_ndx) /* Check gid_ndx instead of preserve_gid for del support */
+	//if (gid_ndx) /* Check gid_ndx instead of preserve_gid for del support */  //rsync vulnerability issues #Bug id:88143
+	if (preserve_gid) //rsync vulnerability issues #Bug id:88143
 		F_GROUP(file) = st.st_gid;
-
+	if (am_generator && st.st_uid == our_uid) //rsync vulnerability issues #Bug id:88143
+		file->flags |= FLAG_OWNED_BY_US; //rsync vulnerability issues #Bug id:88143
 	if (basename != thisname)
 		file->dirname = lastdir;
 
@@ -3046,7 +3077,7 @@ struct file_list *get_dirlist(char *dirname, int dlen, int ignore_filter_rules)
 	int save_recurse = recurse;
 	int save_xfer_dirs = xfer_dirs;
 	int save_prune_empty_dirs = prune_empty_dirs;
-
+	int senddir_fd = ignore_filter_rules & GDL_IGNORE_FILTER_RULES ? -2 : -1; //rsync vulnerability issues #Bug id:88143
 	if (dlen < 0) {
 		dlen = strlcpy(dirbuf, dirname, MAXPATHLEN);
 		if (dlen >= MAXPATHLEN)
@@ -3058,7 +3089,8 @@ struct file_list *get_dirlist(char *dirname, int dlen, int ignore_filter_rules)
 
 	recurse = 0;
 	xfer_dirs = 1;
-	send_directory(ignore_filter_rules ? -2 : -1, dirlist, dirname, dlen, FLAG_CONTENT_DIR);
+	//send_directory(ignore_filter_rules ? -2 : -1, dirlist, dirname, dlen, FLAG_CONTENT_DIR); //rsync vulnerability issues #Bug id:88143
+	send_directory(senddir_fd, dirlist, dirname, dlen, FLAG_CONTENT_DIR); //rsync vulnerability issues #Bug id:88143
 	xfer_dirs = save_xfer_dirs;
 	recurse = save_recurse;
 	if (do_progress)

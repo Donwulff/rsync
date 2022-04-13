@@ -21,6 +21,11 @@
 
 #include "rsync.h"
 
+#ifdef QNAPNAS
+extern int module_id;
+extern int module_id_filename_len;
+#endif	//QNAPNAS
+
 extern int verbose;
 extern int dry_run;
 extern int do_xfers;
@@ -124,6 +129,48 @@ int get_tmpname(char *fnametmp, const char *fname)
 	return 1;
 }
 
+#ifdef QNAPNAS //bug 126413
+static int get_tmpname2(char *fnametmp, const char *fname, const int fs_name_max)
+{
+	int maxname, added, length = 0;
+	const char *f;
+
+	if (tmpdir) {
+		/* Note: this can't overflow, so the return value is safe */
+		length = strlcpy(fnametmp, tmpdir, MAXPATHLEN - 2);
+		fnametmp[length++] = '/';
+	}
+
+	if ((f = strrchr(fname, '/')) != NULL) {
+		++f;
+		if (!tmpdir) {
+			length = f - fname;
+			/* copy up to and including the slash */
+			strlcpy(fnametmp, fname, length + 1);
+		}
+	} else
+		f = fname;
+	fnametmp[length++] = '.';
+
+	/* The maxname value is bufsize, and includes space for the '\0'.
+	 * (Note that fs_name_max get -8 for the leading '.' above.) */
+	maxname = MIN(MAXPATHLEN - 7 - length, fs_name_max - 8);
+
+	if (maxname < 1) {
+		rprintf(FERROR_XFER, "temporary filename too long: %s\n", fname);
+		fnametmp[0] = '\0';
+		return 0;
+	}
+
+	added = strlcpy(fnametmp + length, f, maxname);
+	if (added >= maxname)
+		added = maxname - 1;
+	memcpy(fnametmp + length + added, ".XXXXXX", 8);
+
+	return 1;
+}
+#endif
+
 /* Opens a temporary file for writing.
  * Success: Writes name into fnametmp, returns fd.
  * Failure: Clobbers fnametmp, returns -1.
@@ -132,8 +179,18 @@ int open_tmpfile(char *fnametmp, const char *fname, struct file_struct *file)
 {
 	int fd;
 
+	#ifdef QNAPNAS //bug 126413
+	if (module_id >= 0 && module_id_filename_len > 0) {
+		if (!get_tmpname2(fnametmp, fname, module_id_filename_len)) //EncryptFS filename limitation is 143 characters
+			return -1;
+	} else {
+		if (!get_tmpname2(fnametmp, fname, NAME_MAX))
+			return -1;
+	}
+	#else
 	if (!get_tmpname(fnametmp, fname))
 		return -1;
+	#endif
 
 	/* We initially set the perms without the setuid/setgid bits or group
 	 * access to ensure that there is no race condition.  They will be
@@ -154,8 +211,13 @@ int open_tmpfile(char *fnametmp, const char *fname, struct file_struct *file)
 #endif
 
 	if (fd == -1) {
+		#ifdef QNAPNAS //it will not be here after fix bug 126413
+		rsyserr(FERROR_XFER, errno, "Failed to generate temp file from \"%s\" for \"%s\" failed",
+			full_fname(fnametmp), fname);
+		#else
 		rsyserr(FERROR_XFER, errno, "mkstemp %s failed",
 			full_fname(fnametmp));
+		#endif
 		return -1;
 	}
 

@@ -157,7 +157,55 @@ static void write_ndx_and_attrs(int f_out, int ndx, int iflags,
 #endif
 }
 
-void send_files(int f_in, int f_out)
+#ifdef RSYNC_PROGRESS
+extern unsigned long long Tick_Diff(unsigned long long itBase);
+
+/**
+ * \brief	Update the progress for the skipped dirs / files before free the file elist.
+ * \param	flist		the file list that is going to be freed
+ */
+void Update_Stats_Before_Free_FList(const struct file_list *flist)
+{
+	int  idx;
+	struct file_struct *ptFile;
+	unsigned long long  msDiff;
+	extern unsigned long long  smsSent;
+
+	#ifdef	QNAP_DEBUG
+	char fname[MAXPATHLEN];
+	#endif
+
+	for (idx=0; idx<flist->used; idx++)
+	{
+		ptFile = flist->files[idx];
+		if (S_ISDIR(ptFile->mode) || ptFile->nbSize)  stats.nfDone ++;
+		if (ptFile->nbSize)
+		{
+			stats.nbSkip += ptFile->nbSize;
+			if (MIN_TICK_DIFF_UPDATE > (msDiff = Tick_Diff(smsSent))) continue;
+			smsSent += msDiff;
+			Update_Progress(stats.msSent, stats.nbSent, stats.nbSkip, stats.nbTotal, stats.ttStat.cbFiles);
+		}
+		// Special handle when there are only empty folders.
+		else if (stats.nfDone == stats.nfTotal)
+		{
+			if (MIN_TICK_DIFF_UPDATE > (msDiff = Tick_Diff(smsSent))) continue;
+			smsSent += msDiff;
+			Update_Progress(-1, 0, 0, 0, 0);
+		}
+		#ifdef	QNAP_DEBUG
+		f_name(ptFile, fname);
+		printf("==> %3lld%%, File: %d/%d, Size: %lld/%lld/%lld (%lld, %s)\n", (stats.nbTotal) ? ((stats.nbSkip+stats.nbSent)*100)/ stats.nbTotal : 0, stats.nfDone, stats.nfTotal, stats.nbSkip, stats.nbSent, stats.nbTotal, ptFile->nbSize, fname);
+		#endif
+	}
+}
+#endif	//RSYNC_PROGRESS
+
+#ifdef QNAPNAS
+int send_files(int f_in, int f_out)
+#else
+//void send_files(int f_in, int f_out)
+#endif
 {
 	int fd = -1;
 	struct sum_struct *s;
@@ -175,6 +223,15 @@ void send_files(int f_in, int f_out)
 	int f_xfer = write_batch < 0 ? batch_fd : f_out;
 	int save_io_error = io_error;
 	int ndx, j;
+#ifdef QNAPNAS
+	int diff = 0;
+#endif
+
+#ifdef	RSYNC_PROGRESS
+	int iFile = 0;							///< the file index supposed to be sent
+	struct file_list *ptList=first_flist;	///< the current file list
+	extern char  *pszSchedule;
+#endif	//RSYNC_PROGRESS
 
 	if (verbose > 2)
 		rprintf(FINFO, "send_files starting\n");
@@ -188,6 +245,35 @@ void send_files(int f_in, int f_out)
 					 xname, &xlen);
 		if (ndx == NDX_DONE) {
 			if (inc_recurse && first_flist) {
+
+#ifdef RSYNC_PROGRESS
+				if (pszSchedule)
+				{
+					if (!ptList)
+					{
+						ptList = first_flist;
+					}
+					if ((iFile < stats.nfTotal) && ((ptList == first_flist) || (iFile < first_flist->ndx_start+first_flist->used)))
+					{
+						ptList = first_flist->next;
+
+						if (ptList)
+						{
+							iFile = ptList->ndx_start;
+						}
+						else
+						{
+							iFile = first_flist->ndx_start + first_flist->used;
+						}
+					}
+					Update_Stats_Before_Free_FList(first_flist);
+					if (first_flist == ptList)
+					{
+						ptList = NULL;
+					}
+				}
+#endif	//RSYNC_PROGRESS
+
 				flist_free(first_flist);
 				if (first_flist) {
 					write_ndx(f_out, NDX_DONE);
@@ -201,6 +287,95 @@ void send_files(int f_in, int f_out)
 			write_ndx(f_out, NDX_DONE);
 			continue;
 		}
+
+#ifdef	RSYNC_PROGRESS
+		// Update the progress for the skipped dirs / files
+		else if (pszSchedule)
+		{
+			struct file_struct *ptFile;
+
+			for (; ptList && (iFile < ndx); iFile++)
+			{
+				if (iFile >= (ptList->ndx_start+ptList->used))
+				{
+					// reach the end of list, goto the next list
+					ptList = ptList->next;
+				}
+
+				#ifdef	QNAP_DEBUG_LIST
+				if (ptList)
+				{
+					printf("ptList -- files: %p, used: %d, malloced: %d, low: %d, high: %d, ndx_start: %d, flist_num: %d, parent_ndx: %d, in_progress: %d, to_redo: %d\n",
+						ptList->files, ptList->used, ptList->malloced, ptList->low, ptList->high,
+						ptList->ndx_start, ptList->flist_num, ptList->parent_ndx, ptList->in_progress, ptList->to_redo);
+				}
+				else
+				{
+					printf("ptList: %p\n", ptList);
+				}
+				#endif	//QNAP_DEBUG_LIST
+
+				// Special handle empty folders
+				if (!ptList || !ptList->files || !ptList->malloced || ((ptList->high - ptList->low + 1) != ptList->used) || (0 > ptList->parent_ndx))
+				{
+					break;
+				}
+				else if (iFile < ptList->ndx_start)
+				{
+					// this is a directory
+					#ifdef	QNAP_DEBUG_LIST
+					if (dir_flist)
+					{
+						printf("dir_flist -- files %p, used: %d, malloced: %d, low: %d, high: %d\n", dir_flist->files, dir_flist->used, dir_flist->malloced, dir_flist->low, dir_flist->high);
+					}
+					else
+					{
+						printf("dir_flist: %p\n", dir_flist);
+					}
+					#endif	//QNAP_DEBUG_LIST
+
+					if (!dir_flist || !dir_flist->files || ((dir_flist->high - dir_flist->low + 1) != dir_flist->used))
+					{
+						break;
+					}
+
+					#ifdef	QNAP_DEBUG
+					if ((dir_flist->used > ptList->parent_ndx) && NULL != (ptFile = dir_flist->files[ptList->parent_ndx]))
+						printf("--> Skip Dir: %s/%s\n", ptFile->dirname, ptFile->basename);
+					#endif
+				}
+				else if (iFile < (ptList->ndx_start+ptList->used))
+				{
+					if  ((0 > (iFile - ptList->ndx_start)) || !ptList->files[iFile-ptList->ndx_start])
+					{
+							break;
+					}
+					// this could be a file or directory
+					ptFile = ptList->files[iFile-ptList->ndx_start];
+
+					#ifdef	QNAP_DEBUG
+					if (!S_ISDIR(ptFile->mode))
+					{
+						printf("--> Skip File: %lld, %s/%s\n", ptFile->nbSize, ptFile->dirname, ptFile->basename);
+					}
+					#endif
+					if (ptFile->nbSize)
+					{
+						unsigned long long  msDiff;
+						extern unsigned long long  smsSent;
+						stats.nbSkip += ptFile->nbSize;
+						if (MIN_TICK_DIFF_UPDATE <= (msDiff = Tick_Diff(smsSent)))
+						{
+							smsSent += msDiff;
+							Update_Progress(stats.msSent, stats.nbSent, stats.nbSkip, stats.nbTotal, stats.ttStat.cbFiles);
+						}
+						ptFile->nbSize = 0;
+					}
+				}
+			}
+			iFile = ndx + 1;
+		}
+#endif	//RSYNC_PROGRESS
 
 		if (inc_recurse)
 			send_extra_file_list(f_out, FILECNT_LOOKAHEAD);
@@ -268,6 +443,9 @@ void send_files(int f_in, int f_out)
 			log_item(FCLIENT, file, &stats, iflags, NULL);
 			write_ndx_and_attrs(f_out, ndx, iflags, fname, file,
 					    fnamecmp_type, xname, xlen);
+#ifdef QNAPNAS
+			diff = 1;
+#endif
 			continue;
 		}
 
@@ -276,7 +454,11 @@ void send_files(int f_in, int f_out)
 		if (!(s = receive_sums(f_in))) {
 			io_error |= IOERR_GENERAL;
 			rprintf(FERROR_XFER, "receive_sums failed\n");
+#ifdef QNAPNAS
+			return -1;
+#else
 			exit_cleanup(RERR_PROTOCOL);
+#endif
 		}
 
 		fd = do_open(fname, O_RDONLY, 0);
@@ -306,7 +488,11 @@ void send_files(int f_in, int f_out)
 			rsyserr(FERROR_XFER, errno, "fstat failed");
 			free_sums(s);
 			close(fd);
+#ifdef QNAPNAS
+			return -1;
+#else
 			exit_cleanup(RERR_PROTOCOL);
+#endif
 		}
 
 		if (st.st_size) {
@@ -334,9 +520,24 @@ void send_files(int f_in, int f_out)
 
 		set_compression(fname);
 
+#ifdef	RSYNC_PROGRESS
+		#ifdef	QNAP_DEBUG
+		if (file)  printf("--> Sent File: %lld, %s\n", file->nbSize, fname);
+		#endif
+		if (pszSchedule)  Begin_Send_File(&stats);
+#endif	//RSYNC_PROGRESS
+
 		match_sums(f_xfer, s, mbuf, st.st_size);
 		if (do_progress)
 			end_progress(st.st_size);
+
+#ifdef	RSYNC_PROGRESS
+		if (file && pszSchedule)
+		{
+			End_Send_File(&stats, file->nbSize);
+			file->nbSize = 0;
+		}
+#endif	//RSYNC_PROGRESS
 
 		log_item(log_code, file, &initial_stats, iflags, NULL);
 
@@ -371,4 +572,16 @@ void send_files(int f_in, int f_out)
 	match_report();
 
 	write_ndx(f_out, NDX_DONE);
+
+#ifdef	RSYNC_PROGRESS
+	if (pszSchedule)
+	{
+		stats.nbTotal = stats.nbSent + stats.nbSkip;
+		Update_Progress(stats.msSent, stats.nbSent, stats.nbSkip, stats.nbTotal, stats.ttStat.cbFiles);
+	}
+#endif	//RSYNC_PROGRESS
+
+#ifdef QNAPNAS
+	return diff;
+#endif
 }

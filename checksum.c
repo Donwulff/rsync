@@ -23,6 +23,9 @@
 
 extern int checksum_seed;
 extern int protocol_version;
+#ifdef QNAPNAS
+extern int g_bNoChecksum;
+#endif
 
 int csum_length = SHORT_SUM_LENGTH; /* initial value */
 
@@ -159,6 +162,9 @@ void sum_init(int seed)
 {
 	char s[4];
 
+#ifdef QNAPNAS
+	if (g_bNoChecksum) return;
+#endif
 	if (protocol_version >= 30)
 		md5_begin(&md);
 	else {
@@ -179,6 +185,9 @@ void sum_init(int seed)
  **/
 void sum_update(const char *p, int32 len)
 {
+#ifdef QNAPNAS
+	if (g_bNoChecksum) return;
+#endif
 	if (protocol_version >= 30) {
 		md5_update(&md, (uchar *)p, len);
 		return;
@@ -211,6 +220,12 @@ void sum_update(const char *p, int32 len)
 
 int sum_end(char *sum)
 {
+#ifdef QNAPNAS
+	if (g_bNoChecksum) {
+		*sum = '\0';
+		return 1;
+	}
+#endif
 	if (protocol_version >= 30) {
 		md5_result(&md, (uchar *)sum);
 		return MD5_DIGEST_LEN;

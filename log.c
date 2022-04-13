@@ -150,7 +150,12 @@ static void syslog_init()
 static void logfile_open(void)
 {
 	mode_t old_umask = umask(022 | orig_umask);
+#ifdef QNAPNAS
+	logfile_fp = fopen(logfile_name, "w");
+	//Modify by KenChen for preventing increasing log
+#else
 	logfile_fp = fopen(logfile_name, "a");
+#endif
 	umask(old_umask);
 	if (!logfile_fp) {
 		int fopen_errno = errno;

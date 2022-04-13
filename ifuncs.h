@@ -108,3 +108,51 @@ toUpper(const char *ptr)
 {
 	return toupper(*(unsigned char *)ptr);
 }
+
+// jeff modify 2011.8.26, for limit band width
+#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+typedef struct _T_LIMITRATE_
+{
+	int idPID;						//<<< The process id of child of rsyncd
+	int bSender;					//<<< The flag of send/receive(1: send, 0: receive)
+	int cbSBwlimit;					//<<< The band width limit of sending.
+	int cbRBwlimit;					//<<< The band width limit of receiving.
+}T_LIMITRATE, *PT_LIMITRATE;
+
+#define MSEC_PER_SECOND				1000
+#define CN_MAX_JOB 					32							//<<< The max amount of job.
+#define IKEY_SHM_LIMITRATE_SERVER 	873							//<<< The key of share memory stores value of band width.
+#define CN_BWLIMIT_SLOT				CN_MAX_JOB*2				//<<< The amount of slot stored band width limit data in rsync.bwlimit.
+#define NB_SHM_LIMITRATE_SERVER		sizeof(T_LIMITRATE)*CN_BWLIMIT_SLOT		//<<< The size of all band width limit data in rsync.bwlimit.
+#define TRUE						1							//<<< The define of 1
+#define FALSE						0							//<<< The define of 0
+
+#define	SZP_RSYNCD_CONF			"/etc/config/rsyncd.conf"		//<<< The path of rsyncd.cond
+
+#define SZK_RSYNCD_SLIMITRATE	"SLimitRate"					//<<< The key of band width of sending data.
+#define SZK_RSYNCD_RLIMITRATE	"RLimitRate"					//<<< The key of band width of receiving data.
+
+#define SZV_RSYNCD_SLIMITRATE_DEF	"0"							//<<< The default value of band width of sending data.
+#define SZV_RSYNCD_RLIMITRATE_DEF	"0"							//<<< The default value of band width of receiving data.
+#define SZ_OPT_QNAP_BWLIMIT			"--qnap-bwlimit"			//<<< The option of band width limit of qnap.
+
+#define CB_MIN_LIMITRATE	1024								//<<< The minimum limit rate(1KB/sec).
+
+extern int g_bAbort;
+extern int daemon_bwlimit;
+extern int bwlimit;
+extern size_t bwlimit_writemax;
+extern int g_bQnapBwlimit;
+extern int g_bQnapSSHBwlimit;
+
+/**
+ * \brief	Check whether if there data is available on a file descriptor or not.
+ * \param	fdSocket	The file descriptor to read.
+ * \param	msWait		The mini-second of timeout to check the file descriptor.
+ * \return	> 0 if data is available, 0 if timeout, or -XXX if error.
+ */
+int Is_FD_Ready_To_Read(int fdSocket, int msWait);
+#endif /*QNAPNAS && SUPPORT_LIMITRATE*/
+
+extern int g_bSnapshot;
+extern char *g_cProgressLog;

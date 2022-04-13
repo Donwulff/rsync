@@ -992,7 +992,61 @@ static void read_loop(int fd, char *buf, size_t len)
 		len -= n;
 	}
 }
+#ifdef SUPPORT_LIMITRATE
+/**
+ * Sleep after writing to limit I/O bandwidth usage.
+ *
+ * @todo Rather than sleeping after each write, it might be better to
+ * use some kind of averaging.  The current algorithm seems to always
+ * use a bit less bandwidth than specified, because it doesn't make up
+ * for slow periods.  But arguably this is a feature.  In addition, we
+ * ought to take the time used to write the data into account.
+ *
+ * During some phases of big transfers (file FOO is uptodate) this is
+ * called with a small bytes_written every time.  As the kernel has to
+ * round small waits up to guarantee that we actually wait at least the
+ * requested number of microseconds, this can become grossly inaccurate.
+ * We therefore keep track of the bytes we've written over time and only
+ * sleep when the accumulated delay is at least 1 tenth of a second.
+ **/
+static void sleep_for_bwlimit(int bytes_written)
+{
+	static struct timeval prior_tv;
+	static long long total_written = 0;
+	struct timeval tv, start_tv;
+	long elapsed_usec, sleep_usec;
 
+#define ONE_SEC	1000000L /* # of microseconds in a second */
+	if (!bwlimit_writemax)
+		return;
+
+	total_written += bytes_written;
+
+	gettimeofday(&start_tv, NULL);
+	if (prior_tv.tv_sec) {
+		elapsed_usec = (start_tv.tv_sec - prior_tv.tv_sec) * ONE_SEC
+			     + (start_tv.tv_usec - prior_tv.tv_usec);
+		total_written -= elapsed_usec * bwlimit / (ONE_SEC/1024);
+		if (total_written < 0)
+			total_written = 0;
+	}
+
+	sleep_usec = total_written * (ONE_SEC/1024) / bwlimit;
+	if (sleep_usec < ONE_SEC / 10) {
+		prior_tv = start_tv;
+		return;
+	}
+
+	tv.tv_sec  = sleep_usec / ONE_SEC;
+	tv.tv_usec = sleep_usec % ONE_SEC;
+	select(0, NULL, NULL, NULL, &tv);
+
+	gettimeofday(&prior_tv, NULL);
+	elapsed_usec = (prior_tv.tv_sec - start_tv.tv_sec) * ONE_SEC
+		     + (prior_tv.tv_usec - start_tv.tv_usec);
+	total_written = (sleep_usec - elapsed_usec) * bwlimit / (ONE_SEC/1024);
+}
+#endif /* SUPPORT_LIMITRATE */
 /**
  * Read from the file descriptor handling multiplexing - return number
  * of bytes read.
@@ -1004,6 +1058,10 @@ static int readfd_unbuffered(int fd, char *buf, size_t len)
 	size_t msg_bytes;
 	int tag, cnt = 0;
 	char line[BIGPATHBUFLEN];
+	#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+	size_t n=0, left;
+	char *pszBuf;
+	#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 
 	if (!iobuf_in || fd != iobuf_f_in)
 		return read_timeout(fd, buf, len);
@@ -1031,13 +1089,34 @@ static int readfd_unbuffered(int fd, char *buf, size_t len)
 
 		switch (tag) {
 		case MSG_DATA:
+
 			if (msg_bytes > iobuf_in_siz) {
 				if (!(iobuf_in = realloc_array(iobuf_in, char,
 							       msg_bytes)))
 					out_of_memory("readfd_unbuffered");
 				iobuf_in_siz = msg_bytes;
 			}
+
+			// jeff modify 2011.8.26, for limit band width when receiving data
+			#if defined(QNAPNAS) && defined(SUPPORT_LIMITRATE)
+			if(g_bQnapBwlimit)
+			{
+				pszBuf = iobuf_in;
+				for(n=left=msg_bytes;left;left-=n)
+				{
+					if (bwlimit_writemax && n > bwlimit_writemax)
+						n = bwlimit_writemax;
+					n = (n <= left) ? n : left;
+					read_loop(fd, pszBuf, n);
+					pszBuf += n;
+					sleep_for_bwlimit(n);
+				}
+			}
+			else
 			read_loop(fd, iobuf_in, msg_bytes);
+			#else
+			read_loop(fd, iobuf_in, msg_bytes);
+			#endif /* QNAPNAS && SUPPORT_LIMITRATE */
 			iobuf_in_remaining = msg_bytes;
 			iobuf_in_ndx = 0;
 			break;
@@ -1367,7 +1446,7 @@ void write_sum_head(int f, struct sum_struct *sum)
 		write_int(f, sum->s2length);
 	write_int(f, sum->remainder);
 }
-
+#ifndef SUPPORT_LIMITRATE
 /**
  * Sleep after writing to limit I/O bandwidth usage.
  *
@@ -1387,7 +1466,7 @@ void write_sum_head(int f, struct sum_struct *sum)
 static void sleep_for_bwlimit(int bytes_written)
 {
 	static struct timeval prior_tv;
-	static long total_written = 0;
+	static long long total_written = 0;
 	struct timeval tv, start_tv;
 	long elapsed_usec, sleep_usec;
 
@@ -1422,7 +1501,7 @@ static void sleep_for_bwlimit(int bytes_written)
 		     + (prior_tv.tv_usec - start_tv.tv_usec);
 	total_written = (sleep_usec - elapsed_usec) * bwlimit / (ONE_SEC/1024);
 }
-
+#endif /* SUPPORT_LIMITRATE */
 static const char *what_fd_is(int fd)
 {
 	static char buf[20];
